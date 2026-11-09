@@ -1,0 +1,3219 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+# Part of the implementation is borrowed from huggingface/trl.
+
+# fmt: off
+# apply patch before importing trl, which may internally reference GuidedDecodingParams
+try:
+    import vllm
+    try:
+        from vllm.sampling_params import GuidedDecodingParams
+    except ImportError:
+        import vllm.sampling_params
+
+        # removed in https://github.com/vllm-project/vllm/pull/22772
+        vllm.sampling_params.GuidedDecodingParams = vllm.sampling_params.StructuredOutputsParams
+except ImportError:
+    pass
+
+# https://github.com/modelscope/ms-swift/pull/8280
+try:
+    import trl.import_utils as _trl_import_utils
+    _orig = _trl_import_utils.is_vllm_ascend_available
+    if not isinstance(_orig(), bool):
+        _trl_import_utils.is_vllm_ascend_available = lambda: bool(_orig()[0])
+except Exception:
+    pass
+# fmt: on
+
+import concurrent.futures
+import inspect
+import os
+import statistics
+import time
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import transformers
+from accelerate.utils import gather, gather_object, is_peft_model, set_seed
+from collections import defaultdict, deque
+from contextlib import contextmanager, nullcontext
+from copy import deepcopy
+from packaging import version
+from transformers import PreTrainedModel
+from transformers.trainer import Trainer as HfTrainer
+from trl import GRPOTrainer as HFGRPOTrainer
+from trl.models import prepare_deepspeed
+from trl.trainer import grpo_trainer
+from trl.trainer.grpo_trainer import RepeatSampler, nanmax, nanmin
+from trl.trainer.utils import selective_log_softmax
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+from swift.dataset import RowPreprocessor
+from swift.rewards import orms, rm_plugins
+from swift.rl_core.advantage import (apply_rlsd_reweight, compute_advantages,
+                                     compute_advantages_dynamic, compute_reward_metrics, compute_sdar_loss,
+                                     compute_teacher_kl_per_token, compute_teacher_logratio, expand_advantage_to_per_token)
+from swift.rl_core.data import GRPOBatch, GRPOSample
+from swift.rlhf_trainers.grad_spike_guard import install_grad_spike_guard
+from swift.rlhf_trainers.grad_attribution import install_grad_attribution
+from swift.rl_core.grpo_algorithm import score_completions
+from swift.rlhf_trainers.gkd_helpers import (align_teacher_routes_to_completion_turns,
+                                             assemble_teacher_completion_logprobs, build_opsd_samples,
+                                             build_teacher_requests, encode_teacher_view,
+                                             fetch_teacher_parsed_by_routing, remap_teacher_logps_to_student_frame,
+                                             should_compute_local_teacher_logps)
+from swift.sequence_parallel import GatherLoss, sequence_parallel
+from swift.template import Template, TemplateInputs
+from swift.trainers import SwiftMixin, disable_gradient_checkpointing
+from swift.utils import (JsonlWriter, get_cu_seqlens_from_position_ids, get_logger, is_swanlab_available,
+                         is_wandb_available, nanstd, remove_response, seed_worker, to_device,
+                         unwrap_model_for_generation)
+from .arguments import GRPOConfig
+from .rollout_mixin import DataType, OptimizerStepProfileCallback, RolloutTrainerMixin, SyncRefModelCallback
+from .utils import (_ForwardRedirection, collate_to_grpo_micro_batch, compute_chord_loss, encode_sample, encode_samples,
+                    get_even_process_data, identity_data_collator, load_pil_img, make_chord_sft_dataset,
+                    pad_logps_back_to_batch, patch_save_last_checkpoint, profiling_context, profiling_decorator,
+                    replace_assistant_response_with_ids, swanlab_get_run)
+
+try:
+    from trl.trainer.utils import entropy_from_logits
+except ImportError:
+    from .utils import entropy_from_logits
+
+del HFGRPOTrainer.__init__
+del HFGRPOTrainer.log
+grpo_trainer.seed_worker = seed_worker  # fix transformers 4.51.3
+
+logger = get_logger()
+if is_wandb_available():
+    import wandb
+if is_swanlab_available():
+    import swanlab
+
+
+def _select_final_trajectory_rows(table):
+    # Split states share rewards; only terminal states belong in completion tables.
+    if 'training_turn_index' not in table:
+        return table
+    last_rows = {}
+    for i, (index, count, request_id) in enumerate(zip(
+            table['training_turn_index'], table['training_turn_count'], table['request_id'])):
+        if index == count - 1:
+            last_rows[request_id if request_id else i] = i
+    indices = sorted(last_rows.values())
+    return {key: [values[i] for i in indices] for key, values in table.items()}
+
+
+def _guard_invalid_final_advantages(advantages, rollout_infos):
+    # Invalid terminal states must not inherit positive reinforcement from tool rewards.
+    invalid = torch.tensor([
+        info['training_turn_index'] == info['training_turn_count'] - 1
+        and bool(info['output_invalid_reasons']) for info in rollout_infos
+    ], device=advantages.device, dtype=torch.bool)
+    return torch.where(invalid, advantages.clamp(max=0), advantages), invalid
+
+
+def _has_infra_error(rollout_infos):
+    return any(call.get('infra_error') for call in (rollout_infos or {}).get('tool_calls') or [])
+
+
+def _exclude_infra_error_groups(advantages, prompt_ids, infra_errors):
+    # Exclude infrastructure-failure groups: their rewards would distort every peer's advantage.
+    failed = {prompt_id for prompt_id, error in zip(prompt_ids, infra_errors) if error}
+    excluded = torch.tensor([prompt_id in failed for prompt_id in prompt_ids],
+                            device=advantages.device, dtype=torch.bool)
+    return torch.where(excluded, torch.zeros_like(advantages), advantages), excluded
+
+
+def _offload_pixels_enabled() -> bool:
+    return os.environ.get('SWIFT_OFFLOAD_MICROBATCH_PIXELS', '0') == '1'
+
+
+def _is_pixel_key(key) -> bool:
+    return isinstance(key, str) and key.startswith('pixel_values')
+
+
+def _move_pixel_tensors(batch_encoded_inputs, device) -> None:
+    model_inputs = batch_encoded_inputs.get('model_inputs') if isinstance(batch_encoded_inputs, dict) else None
+    if not isinstance(model_inputs, dict):
+        return
+    for key, value in list(model_inputs.items()):
+        if _is_pixel_key(key) and torch.is_tensor(value):
+            model_inputs[key] = value.to(device)
+
+
+def _with_pixel_tensors_on(micro_batch, device):
+    model_inputs = micro_batch.get('model_inputs') if isinstance(micro_batch, dict) else None
+    if not isinstance(model_inputs, dict):
+        return micro_batch
+    moved = {key: (value.to(device, non_blocking=True) if _is_pixel_key(key) and torch.is_tensor(value) else value)
+             for key, value in model_inputs.items()}
+    return {**micro_batch, 'model_inputs': moved}
+
+
+
+def _onpolicy_old_logps_skippable(trainer, is_opsd: bool = False) -> bool:
+    """Whether the batch-preparation old-policy forward can be skipped (opt-in).
+
+    ``SWIFT_SKIP_ONPOLICY_OLD_LOGPS=1`` enables the skip only when every micro-batch of this
+    generation is consumed before the next optimizer step (``not old_policy()``), so the no-grad
+    old forward and the training forward evaluate the same weights. Nothing outside the loss may
+    need the old values: no explicit or API teacher, no OPSD batch (dynamic self-distillation is
+    only active for batches with a teacher prompt), no KL-in-reward and no Liger loss. The loss
+    then uses ``per_token_logps.detach()``, the TRL on-policy convention.
+    """
+    if os.environ.get('SWIFT_SKIP_ONPOLICY_OLD_LOGPS', '0') != '1':
+        return False
+    explicit_teacher = getattr(trainer, '_has_teacher_explicit', None)
+    explicit_teacher = explicit_teacher() if callable(explicit_teacher) else False
+    return not (trainer.old_policy() or is_opsd or explicit_teacher or getattr(trainer, 'use_teacher_api', False)
+                or getattr(trainer, 'kl_in_reward', False) or getattr(trainer, 'use_liger_loss', False))
+
+
+def _local_nograd_chunking(trainer) -> bool:
+    """Opt-in (``SWIFT_LOCAL_NOGRAD_CHUNKING=1``): decide logps chunking per rank for no-grad forwards.
+
+    Reference/old-policy scoring under ZeRO-1/2 runs no collectives, so the per-micro-batch
+    ``gather_object`` only makes every rank wait for the slowest rank's encode and forward. Grad-enabled
+    forwards, ZeRO-3 (parameter all-gathers) and sequence parallelism keep the synchronized path.
+    """
+    if os.environ.get('SWIFT_LOCAL_NOGRAD_CHUNKING', '0') != '1' or torch.is_grad_enabled():
+        return False
+    if getattr(getattr(trainer, 'template', None), 'sequence_parallel_size', 1) > 1:
+        return False
+    from transformers.integrations import is_deepspeed_zero3_enabled
+    return not is_deepspeed_zero3_enabled()
+
+
+class _EncodePrefetch:
+    """Encode micro-batch ``k+1`` on a background thread while ``k`` is collated and scored.
+
+    Opt-in with ``SWIFT_PREFETCH_ENCODE=1``. The trainer's template context (``max_length=None``) is
+    held for the whole preparation loop, so background encodes see the same template state as the
+    serial path; per-batch nested contexts then leave it unchanged. Encoding fills ``sample.encoded``
+    in place, so results and order are identical to the serial loop.
+    """
+
+    def __init__(self, trainer, chunks, template):
+        from concurrent.futures import ThreadPoolExecutor
+        self._chunks, self._template = chunks, template
+        self._context = trainer._template_context(template)
+        self._context.__enter__()
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='swift-encode-prefetch')
+        self._futures = {0: self._submit(0)}
+
+    @classmethod
+    def start(cls, trainer, chunks, template):
+        if os.environ.get('SWIFT_PREFETCH_ENCODE', '0') != '1' or len(chunks) < 2:
+            return None
+        return cls(trainer, chunks, template)
+
+    def _submit(self, index):
+        return self._executor.submit(encode_samples, self._chunks[index], self._template, encode_sample)
+
+    def ready(self, index):
+        """Block until chunk ``index`` is encoded and start encoding the next one."""
+        future = self._futures.pop(index, None) or self._submit(index)
+        future.result()
+        if index + 1 < len(self._chunks) and index + 1 not in self._futures:
+            self._futures[index + 1] = self._submit(index + 1)
+
+    def close(self):
+        try:
+            for future in self._futures.values():
+                future.cancel()
+            self._executor.shutdown(wait=True)
+        finally:
+            self._context.__exit__(None, None, None)
+
+
+def _report_nonfinite_loss(trainer, loss, completion_mask, model_inputs, tensors) -> None:
+    """Log where a non-finite chunk loss comes from (one host sync per chunk).
+
+    bf16 ZeRO steps with inf/NaN gradients are skipped by DeepSpeed ``check_grad_overflow``;
+    this records the offending tensors so the source can be fixed rather than only skipped.
+    Values outside the completion mask still poison masked sums (0 * inf = NaN), so they are
+    counted separately.
+    """
+    if bool(torch.isfinite(loss.detach()).all().item()):
+        return
+    trainer._nonfinite_loss_chunks = getattr(trainer, '_nonfinite_loss_chunks', 0) + 1
+    mask = completion_mask.bool()
+    details = {}
+    for name, tensor in tensors.items():
+        if not torch.is_tensor(tensor):
+            continue
+        value = tensor.detach()
+        bad = ~torch.isfinite(value)
+        if value.shape == mask.shape:
+            inside, outside = int((bad & mask).sum().item()), int((bad & ~mask).sum().item())
+            if inside or outside:
+                details[name] = {'inside_mask': inside, 'outside_mask': outside}
+        elif bool(bad.any().item()):
+            details[name] = {'nonfinite': int(bad.sum().item()), 'shape': list(value.shape)}
+    input_ids = model_inputs.get('input_ids') if isinstance(model_inputs, dict) else None
+    accelerator = getattr(trainer, 'accelerator', None)
+    state = getattr(trainer, 'state', None)
+    logger.warning(
+        '[nonfinite-loss] rank=%s global_step=%s loss=%s chunks_so_far=%s input_shape=%s '
+        'completion_tokens_per_row=%s details=%s', getattr(accelerator, 'process_index', None),
+        getattr(state, 'global_step', None), loss.detach().float().item(), trainer._nonfinite_loss_chunks,
+        None if input_ids is None else list(input_ids.shape), mask.sum(-1).tolist(), details)
+
+
+def _log_nonfinite_guard(trainer, logs: Dict[str, float]) -> None:
+    """Expose skipped non-finite optimizer steps; DeepSpeed leaves grad_norm stale on a skip."""
+    skipped = getattr(getattr(trainer, 'model_wrapped', None), 'skipped_steps', None)
+    if isinstance(skipped, int) and not isinstance(skipped, bool):
+        logs['nonfinite/grad_skipped_steps'] = float(skipped)
+        previous = getattr(trainer, '_reported_skipped_steps', 0)
+        if skipped > previous:
+            logger.warning('[nonfinite-grad] DeepSpeed skipped %d optimizer step(s) with inf/NaN or spike-guarded '
+                           'gradients (cumulative %d, global_step %s).', skipped - previous, skipped,
+                           getattr(getattr(trainer, 'state', None), 'global_step', None))
+            trainer._reported_skipped_steps = skipped
+    logs['nonfinite/loss_chunks_rank0'] = float(getattr(trainer, '_nonfinite_loss_chunks', 0))
+    optimizer = getattr(getattr(trainer, 'model_wrapped', None), 'optimizer', None)
+    if hasattr(optimizer, 'swift_last_global_grad_norm'):
+        # Measured before the skip decision, so it is current even when DeepSpeed's grad_norm is stale.
+        logs['nonfinite/guard_grad_norm'] = float(optimizer.swift_last_global_grad_norm)
+        logs['nonfinite/grad_spike_skips'] = float(getattr(optimizer, 'swift_grad_spike_skips', 0))
+
+class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    sample_cls = GRPOSample
+
+    def __init__(self,
+                 model: Optional[Union[PreTrainedModel, nn.Module]] = None,
+                 ref_model: Optional[Union[PreTrainedModel, nn.Module]] = None,
+                 reward_model: Optional[List[Union[PreTrainedModel, nn.Module]]] = None,
+                 reward_funcs: Optional[List[Union[str, Callable]]] = None,
+                 *_args,
+                 **kwargs):
+        patch_save_last_checkpoint()
+        args: GRPOConfig = kwargs['args']
+        self.args = args
+        self.ref_adapter_name = getattr(args, 'ref_adapter_name', None)
+        self.model_adapter_name = None
+        self.is_multimodal = model.model_meta.is_multimodal
+        self.model_kwarg_keys = (
+            inspect.signature(model.forward).parameters.keys() if not hasattr(model, 'get_base_model') else
+            inspect.signature(model.get_base_model().forward).parameters.keys())
+
+        self.vllm_client = kwargs.pop('vllm_client', None)
+        self.chord_sft_dataset = kwargs.pop('chord_sft_dataset', None)
+        reward_templates = kwargs.pop('reward_template', None)
+        self._pop_teacher_kwargs(kwargs)
+        if args.mask_positive_invalid_final_advantages and (
+                args.multi_turn_scheduler != 'gd_grpo' or self._has_teacher_explicit()):
+            raise ValueError('Invalid-final advantage protection requires gd_grpo without a teacher.')
+        self._prepare_algorithm_params()
+        super().__init__(model, ref_model, *_args, **kwargs)
+        self._prepare_chord_dataset()
+        self.prepare_rollout()
+        self._prepare_rewards(reward_funcs, reward_model, reward_templates)
+
+        # An explicit teacher enables OPD-RL and is the sole signal when reward_funcs is empty.
+        self._setup_teacher()
+        self.teacher_kl_coef = args.teacher_kl_coef
+        self.mopd_advantage_clip = args.mopd_advantage_clip
+        self.mopd_branch_loss_coef = args.mopd_branch_loss_coef
+        if not self.reward_funcs and not self.use_gym_env and not self._has_teacher:
+            raise ValueError('You must specify reward_funcs or reward_model')
+
+        if self.args.eval_strategy != 'no' and not self.args.eval_use_evalscope:
+            total_eval_batch_size = self.args.per_device_eval_batch_size * \
+                self.accelerator.num_processes // self.num_generations_eval
+            assert len(self.eval_dataset) >= total_eval_batch_size, (
+                f'eval_dataset size {len(self.eval_dataset)} is smaller than '
+                f'total_eval_batch_size {total_eval_batch_size}. '
+                f'Please increase the size of eval_dataset or set a larger value for split_dataset_ratio.')
+
+        self._prepare_liger_loss()
+        self._prepare_metrics()
+        install_grad_spike_guard()
+        self._grad_attribution = install_grad_attribution(self)
+
+        # Use unique rank seeds to avoid duplicate transformer completions.
+        set_seed(args.seed, device_specific=True)
+
+        # Our custom loss still needs the parent trainer's gradient-accumulation scaling.
+        self.model_accepts_loss_kwargs = False
+
+        if args.sync_ref_model:
+            self.add_callback(SyncRefModelCallback(self))
+        if os.environ.get('SWIFT_PROFILE_JSONL'):
+            self.add_callback(OptimizerStepProfileCallback(self))
+
+        if self.args.dynamic_sample or self.template.truncation_strategy == 'raise':
+            self._prepare_resample_data_iterator()
+        self.eval_flag = False
+
+        if self.template.sequence_parallel_size > 1:
+            self.args.gradient_accumulation_steps = self.args.gradient_accumulation_steps * sequence_parallel.world_size
+
+        # Multi-turn output counts may require padding for even rank partitions.
+        self.rollout_pad_count = 0
+
+        # Tracks the number of iterations (forward + backward passes), including those within a gradient accumulation cycle. # noqa
+        self._step = 0
+        # Reuse generated batches across num_iterations updates.
+        self._buffered_inputs = None
+        self._current_train_step_time = 0.0
+
+    def _get_data_collator(self, args, template):
+        return identity_data_collator
+
+    def _get_train_sampler(self, train_dataset=None):
+        if self.template.sequence_parallel_size > 1:
+            return RepeatSampler(
+                data_source=train_dataset or self.train_dataset,
+                mini_repeat_count=self.num_generations,
+                batch_size=self.args.generation_batch_size // self.num_generations,
+                repeat_count=self.num_iterations * self.args.steps_per_generation * sequence_parallel.world_size,
+                shuffle=self.shuffle_dataset,
+                seed=self.args.seed,
+            )
+        else:
+            return super()._get_train_sampler(train_dataset)
+
+    @profiling_decorator
+    def _prepare_inputs(self, inputs: DataType) -> Dict[str, Union[torch.Tensor, Any]]:
+        # Training generates and buffers one batch per rollout cycle, returning one micro-batch
+        # per accumulation step. Evaluation generates directly without reuse.
+
+        mode = 'train' if self.model.training else 'eval'
+        if mode == 'train':
+            num_rollout_samples = self.args.steps_per_generation * self.template.sequence_parallel_size
+            generate_every = num_rollout_samples * self.num_iterations
+            if self._step % generate_every == 0 or self._buffered_inputs is None:
+                micro_batches = self._generate_and_score_completions(inputs)
+                self._buffered_inputs = micro_batches
+            micro_batch = self._buffered_inputs[self._step % num_rollout_samples]
+            if _offload_pixels_enabled():
+                # Copy (do not write back): the buffer stays on the host.
+                micro_batch = _with_pixel_tensors_on(micro_batch, self.accelerator.device)
+        else:
+            micro_batch = self._generate_and_score_completions(inputs)
+        return micro_batch
+
+    def _rollout_samples(self, inputs: DataType) -> List[GRPOSample]:
+        """Convert raw rows to samples and generate completions."""
+        if self.template.truncation_strategy == 'raise':
+            inputs = self.resample_encode_failed_inputs(inputs)
+        samples: List[GRPOSample] = self.to_samples(inputs)
+        samples = self._generate_completions(samples)
+        return samples
+
+    @profiling_decorator
+    def _score_completions(self, samples: List[GRPOSample]) -> List[GRPOSample]:
+        """Score completions with reward functions and run DAPO dynamic sampling.
+
+        Rewards are stashed on ``self._rewards_per_func`` for ``_postprocess_batch``
+        (advantages depend on the encoded batches produced after this stage).
+        Returns the (possibly resampled) samples.
+        """
+        total_rewards_per_func = self._compute_rewards_per_func(samples)
+        mode = 'train' if self.model.training else 'eval'
+        if self.dynamic_sample and mode == 'train':
+            # dynamic sampling for std=0 groups
+            samples, total_rewards_per_func = self._dynamic_sampling(samples, total_rewards_per_func)  # noqa
+        self._rewards_per_func = total_rewards_per_func
+        return samples
+
+    def _postprocess_batch(self, samples: List[GRPOSample], batch_encoded_inputs: List[Dict[str, Any]]) -> None:
+        """Compute advantages and write them into each ``grpo_batch``."""
+        # OPD-RL teacher API: fetch single-token teacher logps before advantage computation.
+        if self._has_teacher and self.use_teacher_api:
+            self._assemble_teacher_api_logps(samples, batch_encoded_inputs)
+        total_advantages = self._compute_advantages(samples, self._rewards_per_func, batch_encoded_inputs)
+        if getattr(self.args, 'mask_positive_invalid_final_advantages', False) and self.model.training:
+            if any(gather_object([any(item['grpo_batch'].teacher_per_token_logps is not None
+                                      for item in batch_encoded_inputs)])):
+                raise ValueError('Invalid-final advantage protection does not support teacher-signal batches.')
+            infos = gather_object([
+                {key: s.rollout_infos[key] for key in
+                 ('training_turn_index', 'training_turn_count', 'output_invalid_reasons')} for s in samples
+            ])
+            guarded_advantages, invalid = _guard_invalid_final_advantages(total_advantages, infos)
+            invalid_advantages = total_advantages[invalid]
+            for label, selected in (('positive', invalid_advantages > 0), ('negative', invalid_advantages < 0),
+                                    ('zero', invalid_advantages == 0)):
+                self._metrics['train'][f'invalid_final/{label}_advantage_rate_before_guard'].append(
+                    selected.float().mean().item() if invalid_advantages.numel() else 0.0)
+            self._metrics['train']['invalid_final/positive_advantage_rate_after_guard'].append(
+                (guarded_advantages[invalid] > 0).float().mean().item() if invalid_advantages.numel() else 0.0)
+            total_advantages = guarded_advantages
+        if self.model.training:
+            group_infos = gather_object([(s.prompt_id, _has_infra_error(s.rollout_infos)) for s in samples])
+            total_advantages, excluded = _exclude_infra_error_groups(
+                total_advantages, [prompt_id for prompt_id, _ in group_infos], [error for _, error in group_infos])
+            self._metrics['train']['tools/infra_error_excluded_row_rate'].append(excluded.float().mean().item())
+
+        local_advantages = get_even_process_data(self, total_advantages)
+        assert len(local_advantages) == len(samples)
+        for sample, advantage in zip(samples, local_advantages):
+            sample.advantages = advantage
+        self._logs['advantages'].extend(total_advantages.tolist())
+
+        gas_chunks = self.split_by_mini_batches(samples)
+        assert len(gas_chunks) == len(batch_encoded_inputs), \
+            f'Mismatch: {len(gas_chunks)} chunks vs {len(batch_encoded_inputs)} batches'
+
+        for batch, batch_encoded in zip(gas_chunks, batch_encoded_inputs):
+            # Sequence-parallel gathering can mix devices; move advantages to the current device.
+            device = self.accelerator.device
+            grpo_batch: GRPOBatch = batch_encoded['grpo_batch']
+            base_advantages = torch.stack([data.advantages.to(device) for data in batch])
+            use_rlsd = (self.advantage_reweight == 'rlsd' and grpo_batch.teacher_per_token_logps is not None)
+            use_sdar = (self.sdar_loss_coef > 0 and grpo_batch.teacher_per_token_logps is not None)
+            if use_rlsd:
+                # RLSD reweights the base advantage with the privileged teacher's logprob gap.
+                mode = 'train' if self.model.training else 'eval'
+                lam = self._rlsd_effective_lambda()
+                grpo_batch.advantages = apply_rlsd_reweight(
+                    base_advantages,
+                    grpo_batch.completion_mask,
+                    grpo_batch.teacher_per_token_logps,
+                    grpo_batch.old_per_token_logps,
+                    lam=lam,
+                    clip_range=self.rlsd_reweight_clip_range,
+                    negative_only=self.rlsd_negative_only,
+                )
+                self._metrics[mode]['rlsd_lambda'].append(lam)
+            elif use_sdar:
+                # SDAR leaves base advantages unchanged and consumes teacher signals in the loss.
+                grpo_batch.advantages = expand_advantage_to_per_token(base_advantages, grpo_batch.completion_mask)
+            else:
+                # Expand before adding the per-token teacher log-ratio.
+                grpo_batch.advantages = expand_advantage_to_per_token(base_advantages, grpo_batch.completion_mask)
+                if grpo_batch.teacher_per_token_logps is not None:
+                    teacher_delta = compute_teacher_logratio(
+                        grpo_batch.teacher_per_token_logps,
+                        grpo_batch.old_per_token_logps,
+                        grpo_batch.completion_mask,
+                    )
+                    if self.mopd_advantage_clip is not None:
+                        clip = float(self.mopd_advantage_clip)
+                        teacher_delta = teacher_delta.clamp(min=-clip, max=clip)
+                    grpo_batch.advantages = grpo_batch.advantages + self.teacher_kl_coef * teacher_delta
+            if grpo_batch.branch_token_mask is not None:
+                grpo_batch.advantages = grpo_batch.advantages.masked_fill(grpo_batch.branch_token_mask, 0.0)
+            if grpo_batch.teacher_per_token_logps is not None:
+                mode = 'train' if self.model.training else 'eval'
+                # Monitor non-negative k3; the advantage uses the signed k1 log-ratio.
+                k3 = compute_teacher_kl_per_token(grpo_batch.teacher_per_token_logps, grpo_batch.old_per_token_logps,
+                                                  grpo_batch.completion_mask)
+                self._metrics[mode]['teacher_kl'].append(
+                    (k3.sum() / grpo_batch.completion_mask.sum().clamp(min=1.0)).item())
+
+    def _log_rollout(self, samples: List[GRPOSample]) -> None:
+        """Log prompts/completions and extra gathered metrics (solution, num_turns)."""
+        with profiling_context(self, 'log_metrics'):
+            messages = [s.messages[:-1] for s in samples]
+            completions = [deepcopy(s.messages[-1]['content']) for s in samples]
+            for i, completion in enumerate(completions):
+                if isinstance(completion, str):
+                    continue
+                if isinstance(completion, list):
+                    token_ids = completion
+                elif isinstance(completion, dict):
+                    token_ids = completion['token_ids']
+                completions[i] = self.processing_class.decode(token_ids)
+            valid_messages = self._gather_and_flatten(messages, flatten_level=0)
+            valid_completions = self._gather_and_flatten(completions, flatten_level=0)
+            self._logs['prompt'].extend(self._apply_chat_template_to_messages_list(valid_messages))
+            self._logs['completion'].extend(valid_completions)
+
+            # Every logged key must appear in all rollout outputs to keep collectives aligned.
+            metrics_for_logs_to_gather = {
+                'request_id': [s.request_id for s in samples],
+                'training_turn_index': [(s.rollout_infos or {}).get('training_turn_index', 0) for s in samples],
+                'training_turn_count': [(s.rollout_infos or {}).get('training_turn_count', 1) for s in samples],
+            }
+
+            if all('solution' in s.extra for s in samples):
+                metrics_for_logs_to_gather['solution'] = [s.extra['solution'] for s in samples]
+
+            if all(s.rollout_infos and 'num_turns' in s.rollout_infos for s in samples):
+                metrics_for_logs_to_gather['num_turns'] = [s.rollout_infos['num_turns'] for s in samples]
+
+            if metrics_for_logs_to_gather:
+                for key, value in metrics_for_logs_to_gather.items():
+                    if key not in self._logs:
+                        self._logs[key] = deque(maxlen=self.args.generation_batch_size)
+                    self._logs[key].extend(self._gather_and_flatten(value, flatten_level=0))
+
+            if not self.model.training and any('tool_metadata' in s.extra for s in samples):
+                from reframe.tool_rewards import CROP_TOOL, SELECT_TOOL, tool_iou_metrics
+
+                tool_names = {'crop': CROP_TOOL, 'select': SELECT_TOOL}
+                local_metrics = []
+                for sample in samples:
+                    calls = (sample.rollout_infos or {}).get('tool_calls', [])
+                    sampled_calls = [
+                        call for call in calls
+                        if call.get('sampled', not call.get('injected', False)) and not call.get('injected', False)
+                    ]
+                    local_metrics.append({
+                        'ious': tool_iou_metrics(sample.extra.get('tool_metadata'), sampled_calls),
+                        'called': [call.get('name') for call in sampled_calls],
+                    })
+                for result in gather_object(local_metrics):
+                    for tool_name, call_name in tool_names.items():
+                        value = result['ious'][tool_name]
+                        if value is not None:
+                            self._eval_tool_ious[tool_name].append(value)
+                            if call_name in result['called']:
+                                self._eval_tool_ious_called[tool_name].append(value)
+
+    @profiling_decorator
+    def _compute_rewards_per_func(self, samples: List[GRPOSample]) -> torch.Tensor:
+        """Score completions using all reward functions.
+
+        Args:
+            samples: List of on-policy samples, each carrying messages with conversation history.
+
+        Returns:
+            rewards_per_func: Tensor of shape (num_examples, num_reward_funcs) with all reward values
+        """
+        extra_reward_kwargs = None
+        if self.enable_server_multi_turn:
+            extra_reward_kwargs = {'trajectory_inputs': self._get_trajectory_inputs(samples)}
+
+        with self._disable_sp_context():
+            local_rewards_per_func = score_completions(
+                samples,
+                reward_funcs=self.reward_funcs,
+                reward_model_plugins=self.reward_model_plugins,
+                use_gym_env=self.use_gym_env,
+                device=self.accelerator.device,
+                trainer_state=self.state,
+                extra_reward_kwargs=extra_reward_kwargs,
+            )
+
+        # accelerate.gather cannot reshape a zero-column reward tensor; gather the sample count instead.
+        if local_rewards_per_func.shape[1] == 0:
+            global_count = sum(gather_object([local_rewards_per_func.shape[0]]))
+            return torch.zeros((global_count, 0), dtype=torch.float32, device=self.accelerator.device)
+
+        if not self.dynamic_num_samples:
+            total_rewards_per_func = gather(local_rewards_per_func)
+        else:
+            local_rewards_list = [row.tolist() for row in local_rewards_per_func]
+            total_rewards_per_func = gather_object(local_rewards_list)
+            total_rewards_per_func = torch.tensor(
+                total_rewards_per_func, dtype=torch.float32, device=self.accelerator.device)
+
+        return total_rewards_per_func
+
+    def _gather_reframe_rollout_info(self, samples: List[GRPOSample]) -> Optional[List[Dict[str, Any]]]:
+        reframe_scheduler = getattr(self.args, 'multi_turn_scheduler', None) in {
+            'og_mopd', 'gd_grpo'
+        }
+        if not reframe_scheduler:
+            return None
+
+        from reframe.tool_rewards import (CROP_TOOL, GATE_IOU, SELECT_TOOL, bbox_area_ratio, parse_crop_boxes,
+                                          parse_tool_metadata, tool_iou_metrics)
+
+        local_info = []
+        for sample in samples:
+            calls = (sample.rollout_infos or {}).get('tool_calls') or []
+            metadata = parse_tool_metadata(sample.extra.get('tool_metadata'))
+            preferred_tool = metadata.get('preferred_tool')
+            sampled_calls = [
+                call for call in calls
+                if call.get('sampled', not call.get('injected', False))
+            ]
+            natural_calls = [call for call in sampled_calls if not call.get('injected', False)]
+            info = sample.rollout_infos or {}
+            crop_calls = [call for call in natural_calls if call.get('name') == CROP_TOOL]
+            crop_areas = [
+                bbox_area_ratio(box) for call in crop_calls if call.get('success', True)
+                for box in (parse_crop_boxes(call.get('arguments') or {}) or [])
+            ]
+            local_info.append({
+                'request_id': sample.request_id,
+                'prompt_id': sample.prompt_id or sample.request_id,
+                'modality': sample.get_tag('teacher_route') or ('video' if preferred_tool == SELECT_TOOL else 'image'),
+                'gate_candidate_ious': [call['gate_candidate_iou'] for call in calls
+                                       if call.get('gate_eligible') and call.get('gate_candidate_iou') is not None],
+                # A scored candidate always uses the canonical tool, so its name selects the threshold.
+                'gate_candidate_thresholds': [
+                    GATE_IOU[call['name']] for call in calls
+                    if call.get('gate_eligible') and call.get('gate_candidate_iou') is not None],
+                'crop_areas': crop_areas,
+                'crop_count': len(crop_calls),
+                'crop_removed_count': sum(bool(call.get('crop_on_removed_original')) for call in crop_calls),
+                'invalid_reasons': info.get('output_invalid_reasons', []),
+                'turn_count': info.get('training_turn_count', info.get('num_turns', 1)),
+                'boundary_truncated_turns': info.get('tool_call_boundary_truncated_turns', 0),
+                'retokenized_turns': info.get('tool_call_retokenized_turns', 0),
+                'logprob_turns': info.get('trajectory_rollout_logprob_turns',
+                                        sum(bool(values) for values in (sample.rollout_logprobs or []))),
+                'gate_eligible_count': sum(bool(call.get('gate_eligible')) for call in calls),
+                'gate_replaced_count': sum(bool(call.get('gate_eligible') and call.get('injected')) for call in calls),
+                'tool_ious': tool_iou_metrics(metadata, natural_calls),
+                'called_tools': [call.get('name') for call in natural_calls],
+                'drop_selected': (sample.rollout_infos or {}).get('original_vision_drop_selected'),
+                'drop_applied': info.get('trajectory_original_vision_dropped', info.get('original_vision_dropped')),
+                'execution_count': len(calls),
+                'execution_failure_count': sum(not call.get('success', True) for call in calls),
+                'execution_infra_error_count': sum(bool(call.get('infra_error')) for call in calls),
+                'tool_call_count': len(sampled_calls),
+                'tool_applicable': metadata.get('tool_applicable'),
+            })
+        return gather_object(local_info)
+
+    def _log_reframe_routing_metrics(
+        self,
+        reframe_info: Optional[List[Dict[str, Any]]],
+        rewards_per_func: torch.Tensor,
+        advantages: torch.Tensor,
+        num_generations: int,
+    ) -> None:
+        if reframe_info is None:
+            return
+
+        if self.dynamic_num_samples:
+            last_indices = {}
+            for index, info in enumerate(reframe_info):
+                last_indices[info['request_id']] = index
+            indices = sorted(last_indices.values())
+            reframe_info = [reframe_info[index] for index in indices]
+            rewards_per_func = rewards_per_func[indices]
+            advantages = advantages[indices]
+
+        mode = 'train' if self.model.training else 'eval'
+        device = rewards_per_func.device
+        call_counts = torch.tensor(
+            [info['tool_call_count'] for info in reframe_info], dtype=torch.long, device=device)
+        direct_mask = call_counts == 0
+        tool_mask = call_counts > 0
+        self._metrics[mode]['routing/direct_rate'].append(direct_mask.float().mean().item())
+        self._metrics[mode]['routing/one_tool_rate'].append((call_counts == 1).float().mean().item())
+        self._metrics[mode]['routing/two_plus_tool_rate'].append((call_counts >= 2).float().mean().item())
+        grouped_tool = None
+        mixed = None
+        if not self.dynamic_num_samples and num_generations > 1 and call_counts.numel() % num_generations == 0:
+            grouped_tool = tool_mask.view(-1, num_generations)
+            mixed = grouped_tool.any(dim=1) & ~grouped_tool.all(dim=1)
+            self._metrics[mode]['routing/mixed_group_rate'].append(mixed.float().mean().item())
+
+        if self.dynamic_num_samples and num_generations > 1:
+            groups = {}
+            for index, info in enumerate(reframe_info):
+                groups.setdefault(info['prompt_id'], []).append(index)
+            group_masks = [tool_mask[indices] for indices in groups.values() if len(indices) > 1]
+            if group_masks:
+                self._metrics[mode]['routing/mixed_group_rate'].append(
+                    sum(bool(mask.any() and not mask.all()) for mask in group_masks) / len(group_masks))
+
+        for label, expected in (('applicable', True), ('not_applicable', False), ('unknown', None)):
+            subset = torch.tensor(
+                [info['tool_applicable'] is expected for info in reframe_info], dtype=torch.bool, device=device)
+            if subset.any():
+                self._metrics[mode][f'routing/tool_rate/{label}'].append(tool_mask[subset].float().mean().item())
+
+        eligible = sum(info['gate_eligible_count'] for info in reframe_info)
+        replaced = sum(info['gate_replaced_count'] for info in reframe_info)
+        self._metrics[mode]['gate/eligible_decisions'].append(eligible)
+        self._metrics[mode]['gate/replaced_decisions'].append(replaced)
+        if eligible:
+            self._metrics[mode]['gate/replacement_rate'].append(replaced / eligible)
+        self._metrics[mode]['gate/replaced_trajectory_rate'].append(
+            sum(info['gate_replaced_count'] > 0 for info in reframe_info) / len(reframe_info))
+
+        for modality in ('image', 'video'):
+            subset = [info for info in reframe_info if info['modality'] == modality]
+            count = sum(info['gate_eligible_count'] for info in subset)
+            self._metrics[mode][f'gate/eligible_decisions/{modality}'].append(count)
+            if count:
+                self._metrics[mode][f'gate/replacement_rate/{modality}'].append(
+                    sum(info['gate_replaced_count'] for info in subset) / count)
+            pairs = [pair for info in subset
+                     for pair in zip(info['gate_candidate_ious'], info['gate_candidate_thresholds'])]
+            if pairs:
+                self._metrics[mode][f'gate/threshold_band_rate/{modality}'].append(
+                    sum(abs(value - threshold) <= 0.1 + 1e-9 for value, threshold in pairs) / len(pairs))
+
+        for reason in ('unexecuted_tool_call', 'boxed_count', 'unbalanced_boxed',
+                       'trailing_text', 'unbalanced_tool_response', 'repeated_text', 'length'):
+            self._metrics[mode][f'invalid/{reason}_rate'].append(
+                sum(reason in info['invalid_reasons'] for info in reframe_info) / len(reframe_info))
+        groups = defaultdict(list)
+        for info in reframe_info:
+            groups[info['prompt_id']].append(bool(info['invalid_reasons']))
+        self._metrics[mode]['invalid/all_invalid_group_rate'].append(
+            sum(all(values) for values in groups.values()) / len(groups))
+        turn_count = sum(info['turn_count'] for info in reframe_info)
+        for metric, field in (('boundary_truncated_rate', 'boundary_truncated_turns'),
+                              ('retokenized_rate', 'retokenized_turns'),
+                              ('logprob_turn_available_rate', 'logprob_turns')):
+            self._metrics[mode][f'rollout/{metric}'].append(
+                sum(info[field] for info in reframe_info) / turn_count)
+        crop_count = sum(info['crop_count'] for info in reframe_info)
+        if crop_count:
+            self._metrics[mode]['tools/crop_on_removed_original_rate'].append(
+                sum(info['crop_removed_count'] for info in reframe_info) / crop_count)
+        areas = [area for info in reframe_info for area in info['crop_areas']]
+        if areas:
+            self._metrics[mode]['tools/crop_source_area_ge_0_4_rate'].append(
+                sum(area >= 0.4 for area in areas) / len(areas))
+            for quantile, value in zip(('p10', 'p50', 'p90'),
+                                       torch.tensor(areas).quantile(torch.tensor([0.1, 0.5, 0.9])).tolist()):
+                self._metrics[mode][f'tools/crop_source_area_{quantile}'].append(value)
+
+        from reframe.tool_rewards import CROP_TOOL, SELECT_TOOL
+        for label, name in (('crop', CROP_TOOL), ('select', SELECT_TOOL)):
+            values = [info['tool_ious'][label] for info in reframe_info if info['tool_ious'][label] is not None]
+            called_values = [info['tool_ious'][label] for info in reframe_info
+                             if info['tool_ious'][label] is not None and name in info['called_tools']]
+            if values:
+                self._metrics[mode][f'tools/{label}_iou'].append(sum(values) / len(values))
+            if called_values:
+                self._metrics[mode][f'tools/{label}_iou_called'].append(sum(called_values) / len(called_values))
+                for quantile, value in zip(('p10', 'p50', 'p90'),
+                                           torch.tensor(called_values).quantile(torch.tensor([0.1, 0.5, 0.9])).tolist()):
+                    self._metrics[mode][f'tools/{label}_iou_called_{quantile}'].append(value)
+        executions = sum(info['execution_count'] for info in reframe_info)
+        if executions:
+            self._metrics[mode]['tools/execution_failure_rate'].append(
+                sum(info['execution_failure_count'] for info in reframe_info) / executions)
+            self._metrics[mode]['tools/execution_infra_error_rate'].append(
+                sum(info.get('execution_infra_error_count', 0) for info in reframe_info) / executions)
+
+        correctness_index = next(
+            (i for i, name in enumerate(self.reward_func_names) if name == 'CorrectnessReward'), None)
+        for label, applied in (('drop_applied', True), ('drop_not_applied', False)):
+            subset = torch.tensor([info['drop_applied'] is applied for info in reframe_info],
+                                  dtype=torch.bool, device=device)
+            if subset.any():
+                length_invalid = torch.tensor(['length' in info['invalid_reasons'] for info in reframe_info],
+                                              dtype=torch.float, device=device)
+                self._metrics[mode][f'invalid/length_rate/{label}'].append(length_invalid[subset].mean().item())
+                if correctness_index is not None:
+                    self._metrics[mode][f'routing/correctness/{label}'].append(
+                        rewards_per_func[subset, correctness_index].mean().item())
+        for label, selected in (('drop_selected', True), ('drop_not_selected', False)):
+            subset = torch.tensor([info['drop_selected'] is selected for info in reframe_info],
+                                  dtype=torch.bool, device=device)
+            if subset.any():
+                self._metrics[mode][f'routing/tool_rate/{label}'].append(tool_mask[subset].float().mean().item())
+                if rewards_per_func.shape[1] > 0:
+                    self._metrics[mode][f'routing/advantage/{label}'].append(advantages[subset].mean().item())
+                if correctness_index is not None:
+                    self._metrics[mode][f'routing/correctness/{label}'].append(
+                        rewards_per_func[subset, correctness_index].mean().item())
+        if correctness_index is not None:
+            correctness = rewards_per_func[:, correctness_index]
+            if direct_mask.any():
+                self._metrics[mode]['routing/correctness/direct'].append(correctness[direct_mask].mean().item())
+            if tool_mask.any():
+                self._metrics[mode]['routing/correctness/tool'].append(correctness[tool_mask].mean().item())
+                if mixed is not None and mixed.any():
+                    grouped_correctness = correctness.view(-1, num_generations)
+                    tool_correctness = (
+                        grouped_correctness.masked_fill(~grouped_tool, 0.0).sum(dim=1)
+                        / grouped_tool.sum(dim=1).clamp(min=1)
+                    )
+                    direct_correctness = (
+                        grouped_correctness.masked_fill(grouped_tool, 0.0).sum(dim=1)
+                        / (~grouped_tool).sum(dim=1).clamp(min=1)
+                    )
+                    deltas = (tool_correctness - direct_correctness)[mixed]
+                    self._metrics[mode]['routing/mixed_correctness_delta'].append(deltas.mean().item())
+                    self._metrics[mode]['routing/tool_better_group_rate'].append((deltas > 0).float().mean().item())
+                    self._metrics[mode]['routing/direct_better_group_rate'].append((deltas < 0).float().mean().item())
+                    self._metrics[mode]['routing/equal_group_rate'].append((deltas == 0).float().mean().item())
+        if rewards_per_func.shape[1] > 0:
+            if direct_mask.any():
+                self._metrics[mode]['routing/advantage/direct'].append(advantages[direct_mask].mean().item())
+            if tool_mask.any():
+                self._metrics[mode]['routing/advantage/tool'].append(advantages[tool_mask].mean().item())
+
+    def _compute_advantages(self, samples: List[GRPOSample], rewards_per_func: torch.Tensor,
+                            batch_encoded_inputs: List[Dict[str, Any]]) -> torch.Tensor:
+        """
+        Compute advantages for RL training.
+
+        Supports two modes:
+        1. **Default grouped mode** (no prompt_ids / request_ids provided)
+        - Assumes rewards are grouped by prompt and each prompt has exactly
+            `self.num_generations` completions.
+        - Computes advantages relative to group mean.
+        2. **Request-aware mode** (multi-turn conversations, variable number of samples)
+        - Groups rewards by unique `request_id` and computes statistics per prompt.
+        - Handles dynamic sample sizes where multiple request_ids may share the same prompt.
+
+        Args:
+            samples (List[GRPOSample]):
+                On-policy samples used to derive prompt_id / request_id grouping.
+            rewards_per_func (torch.Tensor):
+                Reward values for each reward function, shape `(N, num_reward_funcs)`.
+
+        Returns:
+            **advantages** (torch.Tensor):
+                Computed advantages, shape `(N,)`.
+        """
+
+        def log_rewards_metrics(rewards: torch.Tensor, rewards_per_func_for_metrics: torch.Tensor,
+                                group_ids: Optional[List[Any]] = None):
+            """Log reward statistics for monitoring. Only log once per unique request_id."""
+            # rewards: [prompt_batch_size, num_generations]
+            # rewards_per_func_for_metrics: [prompt_batch_size*num_generations, self.num_reward_funcs]
+            mode = 'train' if self.model.training else 'eval'
+            num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
+            if group_ids is None:
+                group_rewards = rewards.view(-1, num_generations)
+                group_means = group_rewards.mean(-1)
+                group_stds = group_rewards.std(-1) if num_generations > 1 else torch.zeros_like(group_means)
+            else:
+                # Request-aware rows are ordered by request ID; group by prompt ID explicitly.
+                members: Dict[Any, List[int]] = {}
+                for i, group_id in enumerate(group_ids):
+                    members.setdefault(group_id, []).append(i)
+                groups = [rewards[idxs] for idxs in members.values()]
+                group_means = torch.stack([g.mean() for g in groups])
+                group_stds = torch.stack([g.std() if g.numel() > 1 else g.new_zeros(()) for g in groups])
+            rewards_mean = group_means.mean().item()
+            if self.scale_rewards in ['group', 'none', 'gdpo']:
+                rewards_std = group_stds.mean().item()
+            elif self.scale_rewards == 'batch':
+                rewards_std = rewards.std().item() if rewards.numel() > 1 else 0.0
+            is_std_zero = torch.isclose(group_stds, torch.zeros_like(group_stds))
+
+            self._metrics[mode]['reward'].append(rewards_mean)
+            self._metrics[mode]['reward_std'].append(rewards_std)
+            self._metrics[mode]['frac_reward_zero_std'].append(is_std_zero.float().mean().item())
+
+            for i, name in enumerate(self.reward_func_names):
+                col = rewards_per_func_for_metrics[:, i]
+                self._metrics[mode][f'rewards/{name}/mean'].append(torch.nanmean(col).item())
+                self._metrics[mode][f'rewards/{name}/std'].append(nanstd(col).item())
+
+        def log_rewards_all(rewards_per_func: torch.Tensor):
+            """Log all rewards for debugging."""
+            for i, name in enumerate(self.reward_func_names):
+                self._logs['rewards'][name].extend(rewards_per_func[:, i].tolist())
+
+        kl_values = None
+        if self.kl_in_reward and self.beta != 0.0:
+            kl_list = []
+            for batch_encoded in batch_encoded_inputs:
+                grpo_batch = batch_encoded['grpo_batch']
+                per_token_kl = grpo_batch.old_per_token_logps - grpo_batch.ref_per_token_logps
+                kl = (per_token_kl * grpo_batch.completion_mask).sum(-1)
+                kl_list.append(kl)
+            kl_values = torch.cat(kl_list, dim=0)
+            kl_values = gather(kl_values)
+
+        mode = 'train' if self.model.training else 'eval'
+        num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
+        reframe_info = self._gather_reframe_rollout_info(samples)
+        # Standardize within (prompt, drop coin) groups to avoid comparing dropped trajectories
+        # with easier retained-view peers. Subgroups smaller than two receive zero advantage.
+        drop_group_flags = None
+        if self.model.training and os.environ.get('GD_GRPO_DROP_SUBGROUP_ADVANTAGES', '0') == '1':
+            if reframe_info is None:
+                raise ValueError('Drop subgroup advantage requires gathered rollout drop flags.')
+            raw_drop_flags = [info.get('drop_selected') for info in reframe_info]
+            if any(type(flag) is not bool for flag in raw_drop_flags):
+                raise ValueError('Drop subgroup advantage requires a boolean drop_selected on every rollout.')
+            drop_group_flags = torch.tensor(raw_drop_flags, dtype=torch.bool, device=rewards_per_func.device)
+            if drop_group_flags.numel() != rewards_per_func.shape[0]:
+                raise ValueError('Gathered drop flags do not align with gathered rewards.')
+
+        # Keep weighted rewards for the request-aware (multi-turn) path below.
+        rewards = (rewards_per_func * self.reward_weights.unsqueeze(0)).nansum(dim=1)
+        if self.kl_in_reward and self.beta != 0.0:
+            rewards = rewards - self.beta * kl_values
+
+        if not self.dynamic_num_samples:
+            advantages, weighted_rewards = compute_advantages(
+                rewards_per_func=rewards_per_func,
+                reward_weights=self.reward_weights,
+                num_generations=num_generations,
+                advantage_estimator=self.advantage_estimator,
+                scale_rewards=self.scale_rewards,
+                kl_in_reward=self.kl_in_reward,
+                beta=self.beta,
+                kl_values=kl_values,
+                subgroup_flags=drop_group_flags,
+            )
+
+            if drop_group_flags is not None:
+                flags_grouped = drop_group_flags.view(-1, num_generations)
+                true_counts = flags_grouped.sum(dim=1, keepdim=True)
+                member_counts = torch.where(flags_grouped, true_counts,
+                                            num_generations - true_counts)
+                self._metrics[mode]['routing/drop_subgroup_singleton_rate'].append(
+                    (member_counts < 2).float().mean().item())
+
+            reward_metrics = compute_reward_metrics(
+                rewards=weighted_rewards,
+                rewards_per_func=rewards_per_func,
+                reward_func_names=self.reward_func_names,
+                num_generations=num_generations,
+                scale_rewards=self.scale_rewards,
+            )
+            self._metrics[mode]['reward'].append(reward_metrics.reward_mean)
+            self._metrics[mode]['reward_std'].append(reward_metrics.reward_std)
+            self._metrics[mode]['frac_reward_zero_std'].append(reward_metrics.frac_reward_zero_std)
+            if kl_values is not None:
+                self._metrics[mode]['kl'].append(kl_values.nanmean().item())
+            for name in self.reward_func_names:
+                self._metrics[mode][f'rewards/{name}/mean'].append(reward_metrics.per_func_mean[name])
+                self._metrics[mode][f'rewards/{name}/std'].append(reward_metrics.per_func_std[name])
+            self._log_reframe_routing_metrics(
+                reframe_info, rewards_per_func, advantages, num_generations)
+            log_rewards_all(rewards_per_func)
+            return advantages
+
+        else:
+            prompt_ids = gather_object([s.prompt_id for s in samples])
+            request_ids = gather_object([s.request_id for s in samples])
+            assert rewards.shape[0] == len(prompt_ids) == len(request_ids)
+
+            for rid in set(request_ids):
+                idxs = [i for i, r in enumerate(request_ids) if r == rid]
+                if not torch.allclose(rewards[idxs], rewards[idxs[0]].expand(len(idxs)), atol=1e-6):
+                    raise ValueError(f'Inconsistent rewards detected for request_id={rid}.')
+
+            if drop_group_flags is not None:
+                # Every split turn of a trajectory must carry the same drop coin.
+                flag_by_request: Dict[str, bool] = {}
+                for i, rid in enumerate(request_ids):
+                    value = bool(drop_group_flags[i].item())
+                    if flag_by_request.setdefault(rid, value) != value:
+                        raise ValueError(f'Inconsistent drop flags detected for request_id={rid}.')
+                subgroup_sizes: Dict[Any, int] = {}
+                request_keys = {}
+                for i, rid in enumerate(request_ids):
+                    if rid not in request_keys:
+                        request_keys[rid] = (prompt_ids[i], flag_by_request[rid])
+                for key in request_keys.values():
+                    subgroup_sizes[key] = subgroup_sizes.get(key, 0) + 1
+                singleton = sum(1 for key in request_keys.values() if subgroup_sizes[key] < 2)
+                self._metrics[mode]['routing/drop_subgroup_singleton_rate'].append(
+                    singleton / max(len(request_keys), 1))
+
+            advantages, _ = compute_advantages_dynamic(
+                rewards_per_func=rewards_per_func,
+                reward_weights=self.reward_weights,
+                prompt_ids=prompt_ids,
+                request_ids=request_ids,
+                advantage_estimator=self.advantage_estimator,
+                scale_rewards=self.scale_rewards,
+                kl_in_reward=self.kl_in_reward,
+                beta=self.beta,
+                kl_values=kl_values,
+                subgroup_flags=drop_group_flags,
+            )
+
+            # Metrics are logged on request-deduplicated rewards.
+            unique_indices = self._get_last_indices(request_ids)
+            log_rewards_metrics(
+                rewards=rewards[unique_indices],
+                rewards_per_func_for_metrics=rewards_per_func[unique_indices],
+                group_ids=[prompt_ids[i] for i in unique_indices.tolist()])
+            self._log_reframe_routing_metrics(
+                reframe_info, rewards_per_func, advantages, num_generations)
+            log_rewards_all(rewards_per_func)
+
+            return advantages
+
+    def _collate_teacher_opsd_batch(self, batch: List[GRPOSample], template) -> Tuple[Dict[str, Any], GRPOBatch]:
+        """Encode + collate the OPSD teacher view (teacher_prompt + same response).
+
+        Produces a teacher micro-batch whose completion frame may differ in length from
+        the student's; ``_compute_teacher_logps`` remaps the teacher logps back onto the
+        student frame. ``build_teacher_view`` is already done by ``build_opsd_samples``.
+        """
+        for s in batch:
+            s.encoded = encode_teacher_view(s, template)
+        teacher_model_inputs, teacher_grpo_batch = collate_to_grpo_micro_batch(
+            batch, template, device=self.accelerator.device, use_logits_to_keep=True)
+        teacher_model_inputs.pop('labels', None)
+        for s in batch:
+            s.encoded = encode_sample(s, template)
+            s.encoded.pop('_extra_kwargs', None)
+        return teacher_model_inputs, teacher_grpo_batch
+
+    def _compute_teacher_logps(self,
+                               model_inputs,
+                               grpo_batch,
+                               origin_data=None,
+                               teacher_model_inputs=None,
+                               teacher_grpo_batch=None) -> torch.Tensor:
+        """OPD-RL: per-token teacher logp on the sampled tokens via a local teacher forward.
+
+        Reuses ``_get_per_token_logps_and_entropies`` so the teacher logp frame matches
+        the policy's old/ref logps (token-in-token-out, single token per position).
+        LoRA same-model teacher runs the student under ``disable_adapter``. For OPSD,
+        the teacher forwards its own ``teacher_model_inputs`` (teacher_prompt + same
+        response) and the result is remapped onto the student's completion frame.
+        """
+        is_opsd = teacher_model_inputs is not None
+        # OPSD remaps via completion masks (per-token), which the chunked/multimodal logps path
+        # does not preserve; OPSD self-distillation uses single-token text batches so this holds.
+        fwd_inputs = teacher_model_inputs if is_opsd else model_inputs
+        fwd_batch = teacher_grpo_batch if is_opsd else grpo_batch
+        fwd_origin = None if is_opsd else origin_data
+        with torch.no_grad():
+            if self._teacher_use_disable_adapter:
+                with self.accelerator.unwrap_model(self.model).disable_adapter(), disable_gradient_checkpointing(
+                        self.model, self.args.gradient_checkpointing_kwargs):
+                    teacher_logps = self._get_per_token_logps_and_entropies(
+                        self.model, fwd_inputs, fwd_batch, origin_data=fwd_origin)[0]
+            else:
+                model = self.teacher_model if self.teacher_model else self.model
+                with self.load_teacher_model_context(), disable_gradient_checkpointing(
+                        model, self.args.gradient_checkpointing_kwargs):
+                    teacher_logps = self._get_per_token_logps_and_entropies(
+                        model, fwd_inputs, fwd_batch, origin_data=fwd_origin)[0]
+        if is_opsd:
+            teacher_logps = remap_teacher_logps_to_student_frame(teacher_logps, teacher_grpo_batch.completion_mask,
+                                                                 grpo_batch.completion_mask)
+        return teacher_logps
+
+    def _assemble_teacher_api_logps(self, samples: List[GRPOSample], batch_encoded_inputs: List[Dict[str,
+                                                                                                     Any]]) -> None:
+        """OPD-RL teacher API: fetch the *sampled* token's logp at each response position
+        (``prompt_logprobs=0`` -> ``parse_prompt_logprobs(topk=0)``, the actually-present
+        token, not the top-1) as a completion-frame ``TeacherOutput``, then read its single
+        column as ``teacher_per_token_logps``. Future top-k RL reuses the same ``TeacherOutput``.
+
+        By default each sample routes to one teacher by tag. Reframe MOPD may additionally provide
+        ``teacher_route_by_turn`` in rollout_infos; in that case every teacher scores the sampled
+        trajectory and the resulting logps are merged token by token.
+
+        Samples/requests come from each chunk's ``_chunk_samples`` (the SP-gathered batch that its
+        ``grpo_batch`` was collated from), not the local ``samples`` argument: under SP>1 the local
+        samples are shorter/reordered, which would misalign the teacher logps.
+        """
+        flat_samples: List[GRPOSample] = []
+        chunk_samples_list: List[List[GRPOSample]] = []
+        for batch_encoded in batch_encoded_inputs:
+            chunk = batch_encoded.pop('_chunk_samples', [])
+            chunk_samples_list.append(chunk)
+            flat_samples.extend(chunk)
+
+        # OPSD: populate teacher_messages so build_teacher_requests scores the teacher prompt.
+        build_opsd_samples(flat_samples)
+        requests = build_teacher_requests(flat_samples, self.template)
+        token_routing = len(self.teacher_configs) > 1 and any(
+            (sample.rollout_infos or {}).get('teacher_route_by_turn') for sample in flat_samples)
+        if token_routing:
+            handles = [self._gather_teacher_requests(requests) for _ in self.teacher_configs]
+            parsed_globals = [None] * len(self.teacher_configs)
+            if self.accelerator.is_main_process:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=len(self.teacher_configs)) as pool:
+                    futures = {
+                        pool.submit(
+                            self._infer_teacher_requests,
+                            handle,
+                            0,
+                            self.teacher_clients[teacher_idx],
+                        ): teacher_idx
+                        for teacher_idx, handle in enumerate(handles)
+                    }
+                    for future, teacher_idx in futures.items():
+                        parsed_globals[teacher_idx] = future.result()
+            parsed_by_teacher = [
+                self._scatter_teacher_parsed(handle, parsed_globals[teacher_idx])
+                for teacher_idx, handle in enumerate(handles)
+            ]
+            route_to_teacher = {
+                tag: teacher_idx
+                for teacher_idx, config in enumerate(self.teacher_configs)
+                for tag in config.tags
+            }
+        else:
+            parsed = fetch_teacher_parsed_by_routing(
+                flat_samples,
+                requests,
+                self.teacher_configs,
+                self.teacher_clients,
+                gather_fn=self._gather_teacher_requests,
+                infer_fn=lambda handle, client: self._infer_teacher_requests(
+                    handle, topk=0, teacher_client=client),
+                scatter_fn=self._scatter_teacher_parsed,
+                is_main_process=self.accelerator.is_main_process,
+                tag_key=self.args.teacher_tag_key)
+
+        offset = 0
+        for batch_encoded, chunk in zip(batch_encoded_inputs, chunk_samples_list):
+            grpo_batch: GRPOBatch = batch_encoded['grpo_batch']
+            device = grpo_batch.completion_mask.device
+            n = len(chunk)
+            if token_routing:
+                teacher_logps = []
+                for teacher_parsed in parsed_by_teacher:
+                    teacher_out = assemble_teacher_completion_logprobs(
+                        teacher_parsed[offset:offset + n],
+                        grpo_batch.completion_mask,
+                        device,
+                        response_token_ids=[s.response_token_ids for s in chunk],
+                        response_loss_mask=[s.response_loss_mask for s in chunk],
+                        completion_turn_token_ids=grpo_batch.completion_turn_token_ids)
+                    teacher_logps.append(teacher_out.topk_logprobs[..., 0])
+                merged = torch.zeros_like(teacher_logps[0])
+                for row, sample in enumerate(chunk):
+                    info = sample.rollout_infos or {}
+                    default_route = info.get('default_teacher_route') or sample.get_tag(self.args.teacher_tag_key)
+                    completion_indices = grpo_batch.completion_mask[row].nonzero(as_tuple=True)[0]
+                    routes = align_teacher_routes_to_completion_turns(
+                        info.get('teacher_route_by_turn'), sample.response_loss_mask,
+                        grpo_batch.completion_turn_token_ids[row], default_route)
+                    if len(routes) != len(completion_indices):
+                        raise ValueError(
+                            f'Aligned teacher routes have {len(routes)} tokens but completion_mask has '
+                            f'{len(completion_indices)} for sample {row}.')
+                    for token_index, route in zip(completion_indices, routes):
+                        teacher_idx = route_to_teacher.get(str(route))
+                        if teacher_idx is None:
+                            raise ValueError(
+                                f'No MOPD teacher is registered for token route {route!r}; '
+                                f'available routes: {sorted(route_to_teacher)}')
+                        merged[row, token_index] = teacher_logps[teacher_idx][row, token_index]
+                grpo_batch.teacher_per_token_logps = merged
+            else:
+                teacher_out = assemble_teacher_completion_logprobs(
+                    parsed[offset:offset + n],
+                    grpo_batch.completion_mask,
+                    device,
+                    response_token_ids=[s.response_token_ids for s in chunk],
+                        response_loss_mask=[s.response_loss_mask for s in chunk],
+                        completion_turn_token_ids=grpo_batch.completion_turn_token_ids)
+                grpo_batch.teacher_per_token_logps = teacher_out.topk_logprobs[..., 0]
+            offset += n
+
+    @profiling_decorator
+    def _dynamic_sampling(self, samples: List[GRPOSample],
+                          rewards_per_func: torch.Tensor) -> Tuple[List[GRPOSample], torch.Tensor]:
+        """
+        Perform dynamic sampling to replace samples with zero-reward-variance groups.
+
+        This method implements DAPO (https://arxiv.org/abs/2503.14476) by replacing
+        samples from groups with zero reward variance (std=0) through resampling.
+
+        Args:
+            samples: local on-policy samples
+            rewards_per_func: reward per function for global samples
+
+        Returns:
+            tuple: (samples, rewards_per_func) with zero-variance groups replaced by resampled data
+        """
+        # DAPO https://arxiv.org/abs/2503.14476
+        # Replaces samples with zero-reward-variance groups (std=0)
+        resample_count = 0
+        valid_samples = []
+        valid_rewards_per_func = []
+        origin_data = (samples, rewards_per_func)
+
+        while resample_count < self.max_resample_times:
+            rewards_std = self.compute_std(samples, rewards_per_func)
+            valid_mask = (rewards_std > 0)
+            all_samples = gather_object(samples)
+            valid_samples.extend([s for s, mask in zip(all_samples, valid_mask) if mask])
+            valid_rewards_per_func.append(rewards_per_func[valid_mask])
+            if len(valid_samples) >= self.args.generation_batch_size:
+                break
+
+            inputs = next(self.dynamic_resample_iterator)
+            if self.template.truncation_strategy == 'raise':
+                inputs = self.resample_encode_failed_inputs(inputs)
+            samples = self.to_samples(inputs)
+            samples = self._generate_completions(samples)
+            rewards_per_func = self._compute_rewards_per_func(samples)
+            resample_count += 1
+
+        if len(valid_samples) >= self.args.generation_batch_size:
+            process_slice = slice(
+                self.accelerator.process_index * len(samples),
+                (self.accelerator.process_index + 1) * len(samples),
+            )
+            samples = valid_samples[:self.args.generation_batch_size][process_slice]
+            rewards_per_func = torch.cat(valid_rewards_per_func)[:self.args.generation_batch_size]
+        else:
+            logger.warning(f'There are still std=0 groups present after {self.max_resample_times} retries.')
+            samples, rewards_per_func = origin_data
+
+        return samples, rewards_per_func
+
+    def compute_std(self, samples: List[GRPOSample], rewards_per_func: torch.Tensor) -> torch.Tensor:
+        """Compute the standard deviation of the rewards per function."""
+        device = self.accelerator.device
+        rewards = (rewards_per_func * self.reward_weights.unsqueeze(0)).nansum(dim=1)
+
+        mode = 'train' if self.model.training else 'eval'
+        num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
+        if not self.dynamic_num_samples:
+            grouped_rewards = rewards.view(-1, num_generations)
+            if num_generations > 1:
+                group_rewards_std = grouped_rewards.std(dim=1).repeat_interleave(num_generations)
+            else:
+                group_rewards_std = torch.zeros_like(rewards)
+            return group_rewards_std
+        else:
+            prompt_ids = gather_object([s.prompt_id for s in samples])
+            request_ids = gather_object([s.request_id for s in samples])
+            device = self.accelerator.device
+            unique_indices = self._get_last_indices(request_ids)
+            unique_request_ids = [request_ids[i] for i in unique_indices.cpu()]
+            unique_prompt_ids = [prompt_ids[i] for i in unique_indices.cpu()]
+
+            unique_rewards = rewards[unique_indices]
+            prompt_to_indices = {}
+            for idx, pid in enumerate(unique_prompt_ids):
+                prompt_to_indices.setdefault(pid, []).append(idx)
+
+            prompt_stds = torch.zeros(len(unique_rewards), device=device)
+            for pid, idxs in prompt_to_indices.items():
+                idx_tensor = torch.tensor(idxs, device=device)
+                r_group = unique_rewards[idx_tensor]
+                prompt_stds[idx_tensor] = r_group.std() if len(idxs) > 1 else 0.0
+            rid_to_idx = {rid: idx for idx, rid in enumerate(unique_request_ids)}
+            indices_in_unique = torch.tensor([rid_to_idx[r] for r in request_ids], device=device)
+            rewards_std = prompt_stds[indices_in_unique]
+
+            return rewards_std
+
+    @profiling_decorator
+    def _prepare_batch_inputs(self, samples: List[GRPOSample]) -> List[Dict[str, Any]]:
+        """
+        Prepare the final batch inputs with ref/old_policy logps and other fields for RL training.
+
+        Args:
+            samples (List[GRPOSample]): List of local on-policy samples.
+
+        Returns:
+            List[Dict[str, Any]]: A list of prepared batch dicts (model inputs + ``grpo_batch``),
+            organized as [steps_per_generation][batch_size]
+        """
+        template = self.template
+        gas_chunks = self.split_by_mini_batches(samples)
+        ga_batch_encoded_inputs: List[Dict[str, Any]] = []
+        trajectory_count = None
+        if self.dynamic_num_samples and any(gather_object([
+                any('training_turn_count' in (s.rollout_infos or {}) for s in samples)])):
+            if self.loss_type not in {'grpo', 'sapo', 'dr_grpo'}:
+                raise ValueError('Turn-split trajectory normalization requires grpo, sapo or dr_grpo loss.')
+            local_count = sum(1.0 / (s.rollout_infos or {}).get('training_turn_count', 1) for s in samples)
+            trajectory_count = sum(gather_object([local_count]))
+        prefetch = _EncodePrefetch.start(self, gas_chunks, template)
+        try:
+            for batch_index, batch in enumerate(gas_chunks):
+                teacher_model_inputs = teacher_grpo_batch = None
+                with self._template_context(template):
+                    if prefetch is None:
+                        encode_samples(batch, template, encode_fn=encode_sample)
+                    else:
+                        prefetch.ready(batch_index)
+                    model_inputs, grpo_batch = collate_to_grpo_micro_batch(
+                        batch, template, device=self.accelerator.device, use_logits_to_keep=True)
+                    if trajectory_count is not None:
+                        # Undo turn duplication and microbatch/DDP means before gradient accumulation.
+                        grpo_batch.sequence_loss_weights = torch.tensor(
+                            [1.0 / (s.rollout_infos or {}).get('training_turn_count', 1) for s in batch],
+                            device=self.accelerator.device,
+                        ) * (len(batch) * len(gas_chunks) * self.accelerator.num_processes / trajectory_count)
+                    # Collate the privileged OPSD teacher prompt separately; its length can differ.
+                    has_opsd_batch = build_opsd_samples(batch)
+                    is_opsd = (has_opsd_batch and (self._has_teacher_explicit() or self._is_dynamic_self_distillation))
+                    if is_opsd:
+                        teacher_model_inputs, teacher_grpo_batch = self._collate_teacher_opsd_batch(batch, template)
+
+                model_inputs.pop('labels', None)
+                batch_encoded_inputs = {'model_inputs': model_inputs, 'grpo_batch': grpo_batch}
+                if self.dynamic_num_samples and self.is_multimodal:
+                    batch_encoded_inputs['_origin_data'] = batch
+                if self._has_teacher and self.use_teacher_api:
+                    # Keep SP-gathered samples so teacher requests align with each chunk.
+                    batch_encoded_inputs['_chunk_samples'] = batch
+                origin_data = batch if (self.dynamic_num_samples and self.is_multimodal) else None
+
+                with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+                    if _onpolicy_old_logps_skippable(self, is_opsd=is_opsd):
+                        # The loss substitutes per_token_logps.detach() from the same, not yet updated policy.
+                        grpo_batch.old_per_token_logps = None
+                    else:
+                        grpo_batch.old_per_token_logps = (
+                            self._get_per_token_logps_and_entropies(
+                                self.model, model_inputs, grpo_batch, origin_data=origin_data)[0])
+                    if self.beta == 0.0:
+                        ref_per_token_logps = None
+                    elif self.ref_model is not None:
+                        with disable_gradient_checkpointing(self.ref_model, self.args.gradient_checkpointing_kwargs):
+                            ref_per_token_logps = \
+                                self._get_per_token_logps_and_entropies(
+                                    self.ref_model, model_inputs, grpo_batch, origin_data=origin_data)[0]
+                    else:
+                        with self.null_ref_context():
+                            ref_per_token_logps = \
+                                self._get_per_token_logps_and_entropies(
+                                    self.model, model_inputs, grpo_batch, origin_data=origin_data)[0]
+                    grpo_batch.ref_per_token_logps = ref_per_token_logps
+                    # OPD-RL: local teacher logp on the sampled tokens (API path filled later).
+                    if should_compute_local_teacher_logps(
+                            has_teacher_explicit=self._has_teacher_explicit(),
+                            is_dynamic_self_distillation=self._is_dynamic_self_distillation,
+                            use_teacher_api=self.use_teacher_api,
+                            has_opsd_batch=is_opsd,
+                    ):
+                        grpo_batch.teacher_per_token_logps = self._compute_teacher_logps(
+                            model_inputs,
+                            grpo_batch,
+                            origin_data=origin_data,
+                            teacher_model_inputs=teacher_model_inputs,
+                            teacher_grpo_batch=teacher_grpo_batch)
+                if _offload_pixels_enabled():
+                    # Park buffered fp32 image tensors on the host between micro-batches.
+                    _move_pixel_tensors(batch_encoded_inputs, 'cpu')
+                ga_batch_encoded_inputs.append(batch_encoded_inputs)
+        finally:
+            if prefetch is not None:
+                prefetch.close()
+
+        mode = 'train' if self.model.training else 'eval'
+        logprob_available = gather_object([
+            inp['grpo_batch'].rollout_per_token_logps is not None for inp in ga_batch_encoded_inputs])
+        self._metrics[mode]['rollout/logprob_microbatch_available_rate'].append(
+            sum(logprob_available) / len(logprob_available))
+        device = self.accelerator.device
+        local_lengths = [inp['grpo_batch'].completion_mask.sum(1).tolist() for inp in ga_batch_encoded_inputs]
+        total_lengths = self._gather_and_flatten(local_lengths, dtype=torch.float32, device=device, flatten_level=1)
+
+        num_items_in_batch = total_lengths.sum()
+        for batch_encoded in ga_batch_encoded_inputs:
+            batch_encoded['grpo_batch'].num_items_in_batch = num_items_in_batch
+
+        self._metrics[mode]['completions/mean_length'].append(total_lengths.mean().item())
+        self._metrics[mode]['completions/min_length'].append(total_lengths.min().item())
+        self._metrics[mode]['completions/max_length'].append(total_lengths.max().item())
+
+        local_trunc_masks = [inp['grpo_batch'].truncated_mask.tolist() for inp in ga_batch_encoded_inputs]
+        total_trunc_masks = self._gather_and_flatten(
+            local_trunc_masks, dtype=torch.bool, device=device, flatten_level=1)
+
+        if not self.dynamic_num_samples:
+            clipped_ratio = total_trunc_masks.sum().item() / total_lengths.shape[0]
+            self._metrics[mode]['completions/clipped_ratio'].append(clipped_ratio)
+
+            if all(s.rollout_infos and 'num_turns' in s.rollout_infos for s in samples):
+                num_turns = torch.tensor(gather_object([s.rollout_infos['num_turns'] for s in samples]), device=device)
+                self._metrics[mode]['num_turns'].append(num_turns.float().mean().item())
+        else:
+            request_ids = gather_object([s.request_id for s in samples])
+            last_indices = self._get_last_indices(request_ids)
+
+            final_trunc_masks = total_trunc_masks[last_indices]
+            clipped_ratio = final_trunc_masks.sum().item() / final_trunc_masks.shape[0]
+            self._metrics[mode]['completions/clipped_ratio'].append(clipped_ratio)
+
+            if all(s.rollout_infos and 'num_turns' in s.rollout_infos for s in samples):
+                num_turns_all = torch.tensor(
+                    gather_object([s.rollout_infos['num_turns'] for s in samples]), device=device)
+                final_num_turns = num_turns_all[last_indices]
+                self._metrics[mode]['num_turns'].append(final_num_turns.float().mean().item())
+
+        return ga_batch_encoded_inputs
+
+    def _apply_chat_template_to_messages_list(self, messages_list: DataType):
+        prompts_text = []
+        for messages in messages_list:
+            remove_response(messages)
+            template_inputs = TemplateInputs.from_dict({'messages': messages})
+            res = self.template.encode(template_inputs)
+            prompts_text.append(self.template.safe_decode(res['input_ids']))
+        return prompts_text
+
+    @profiling_decorator
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if getattr(self, '_grad_attribution', None) is not None:
+            # training_step receives raw rows; keep the encoded micro-batch for attribution dumps.
+            self._grad_attribution_inputs = inputs
+        if isinstance(inputs, list):
+            assert len(inputs) == 1
+            inputs = inputs[0]
+        model_inputs = inputs['model_inputs']
+        grpo_batch = inputs['grpo_batch']
+        origin_data = inputs.get('_origin_data')
+        if self.use_liger_loss:
+            unwrapped_model = self.accelerator.unwrap_model(model)
+            return self._forward_redirection(
+                model, unwrapped_model,
+                lambda *_, **__: self.compute_liger_loss(unwrapped_model, model_inputs, grpo_batch), **model_inputs)
+        else:
+            return self._compute_loss(model, model_inputs, grpo_batch, origin_data)
+
+    def _compute_loss(self, model, model_inputs, grpo_batch, origin_data=None):
+        mode = 'train' if self.model.training else 'eval'
+
+        batch_size = grpo_batch.seq_lengths.shape[0] if self.template.padding_free else model_inputs['input_ids'].shape[
+            0]
+        expected_bs = self.args.per_device_train_batch_size if mode == 'train' else self.args.per_device_eval_batch_size
+
+        should_chunk = self.dynamic_num_samples and any(gather_object([batch_size > expected_bs]))
+        if not should_chunk:
+            return self._compute_loss_single(model, model_inputs, grpo_batch)
+        else:
+            # maybe dynamic rollout num for multi-turn training
+            return self._compute_loss_chunked(model, model_inputs, grpo_batch, origin_data)
+
+    def _compute_loss_single(self, model, model_inputs, grpo_batch):
+        """Original loss computation logic for single batch processing."""
+        loss, metrics_data = self._compute_loss_and_metrics(model, model_inputs, grpo_batch)
+        self._update_metrics(metrics_data)
+        return loss
+
+    def _compute_fipo_influence(self, log_ratio: torch.Tensor, coef_1: torch.Tensor, advantages: torch.Tensor,
+                                completion_mask: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute FIPO token-level influence weight from Future-KL divergence."""
+        future_kl_delta = log_ratio.masked_fill(~completion_mask, 0.0)
+
+        # Dual-Clip participation mask: high-ratio tokens do not contribute to Future-KL.
+        if self.args.delta is not None:
+            delta = torch.as_tensor(self.args.delta, dtype=log_ratio.dtype, device=log_ratio.device)
+            high_ratio_mask = coef_1 > delta
+            future_kl_delta = torch.where(high_ratio_mask, torch.zeros_like(future_kl_delta), future_kl_delta)
+
+        seq_len = future_kl_delta.shape[1]
+        future_kl = torch.zeros_like(future_kl_delta)
+        positions = torch.arange(seq_len, device=log_ratio.device).unsqueeze(1)
+        gamma = torch.as_tensor(self.fipo_gamma, dtype=log_ratio.dtype, device=log_ratio.device)
+        chunk_size = 128
+        for chunk_start in range(0, seq_len, chunk_size):
+            chunk_end = min(seq_len, chunk_start + chunk_size)
+            chunk_positions = torch.arange(chunk_start, chunk_end, device=log_ratio.device).unsqueeze(0)
+            distance = chunk_positions - positions
+            future_mask = distance >= 0
+            decay_block = torch.pow(gamma, distance.clamp(min=0)) * future_mask.to(log_ratio.dtype)
+            future_kl += torch.matmul(future_kl_delta[:, chunk_start:chunk_end], decay_block.t())
+        future_kl = future_kl.masked_fill(~completion_mask, 0.0)
+
+        influence_weight = torch.exp(future_kl)
+
+        if self.fipo_clip_range:
+            high = 1 + self.fipo_clip_range
+            low = 1.0 if self.fipo_clip_high_only else 1 - self.fipo_clip_range
+            influence_weight = torch.clamp(influence_weight, min=low, max=high)
+        influence_weight = influence_weight.detach()
+
+        # avoid amplifying negative-advantage tokens with very high IS ratios.
+        safety_mask = torch.ones_like(completion_mask, dtype=torch.bool)
+        if self.fipo_safety_threshold is not None:
+            negative_advantage = advantages < 0
+            high_is_ratio = coef_1 > self.fipo_safety_threshold
+            safety_mask = ~(negative_advantage & high_is_ratio)
+            influence_weight = torch.where(safety_mask, influence_weight,
+                                           torch.clamp(influence_weight, min=0.8, max=1.0))
+
+        metrics = {
+            'future_kl': future_kl,
+            'influence_weight': influence_weight,
+            'safety_mask': safety_mask,
+        }
+        return influence_weight, metrics
+
+    def _compute_loss_and_metrics(self, model, model_inputs: Dict[str, Any], grpo_batch: GRPOBatch):
+        """Core loss computation without metrics recording."""
+        mode = 'train' if self.model.training else 'eval'
+        completion_mask = grpo_batch.completion_mask
+        truncated_mask = grpo_batch.truncated_mask
+        per_token_logps, entropies = self._get_per_token_logps_and_entropies(
+            model, model_inputs, grpo_batch, compute_entropy=self.compute_entropy)
+
+        entropy_mask = None
+        entropy_metrics = {}
+
+        if self.compute_entropy:
+            entropies = entropies.masked_fill(completion_mask == 0, float('nan'))
+            if self.args.log_entropy:
+                per_completion_entropies_mean = torch.nanmean(entropies, dim=1)
+                global_per_completion_entropies_mean = gather(per_completion_entropies_mean)
+                entropy_metrics = {
+                    'entropy_logs': global_per_completion_entropies_mean.tolist(),
+                    'entropy_mean': global_per_completion_entropies_mean.nanmean().item(),
+                    'entropy_max': nanmax(global_per_completion_entropies_mean).item(),
+                    'entropy_min': nanmin(global_per_completion_entropies_mean).item()
+                }
+
+            if self.args.top_entropy_quantile < 1.0:
+                entropy_threshold = torch.nanquantile(entropies.flatten().float(), 1 - self.top_entropy_quantile)
+                entropy_metrics['entropy_threshold'] = entropy_threshold.item()
+                entropy_mask = entropies >= entropy_threshold
+
+        if self.overlong_filter and any(truncated_mask):
+            if all(truncated_mask):
+                logger.info('All completions are overlong and truncated, '
+                            'resulting in NaN some values for some metrics (e.g., KL)')
+            truncated_mask = truncated_mask.unsqueeze(-1).expand_as(completion_mask)
+            completion_mask = completion_mask & (~truncated_mask)
+
+        branch_completion_mask = None
+        if grpo_batch.branch_token_mask is not None:
+            branch_completion_mask = grpo_batch.branch_token_mask.bool() & completion_mask
+            completion_mask = completion_mask & (~branch_completion_mask)
+
+        per_token_kl = None
+        if self.beta != 0.0 and not self.kl_in_reward:
+            ref_per_token_logps = grpo_batch.ref_per_token_logps
+            safe_ratio = torch.clamp(ref_per_token_logps - per_token_logps, min=-20, max=20)
+            per_token_kl = torch.clamp(torch.exp(safe_ratio) - safe_ratio - 1, min=-10, max=10)
+
+        advantages = grpo_batch.advantages
+        old_per_token_logps = (
+            per_token_logps.detach() if grpo_batch.old_per_token_logps is None else grpo_batch.old_per_token_logps)
+
+        rollout_correction_metrics = {}
+        should_compute_rollout_metrics = (
+            self.rollout_importance_sampling_mode is not None or self.log_rollout_offpolicy_metrics)
+
+        local_has_rollout = grpo_batch.rollout_per_token_logps is not None
+        should_compute_rollout_metrics = should_compute_rollout_metrics and all(gather_object([local_has_rollout]))
+        rollout_is_weights = None
+        if (not self.disable_rollout_importance_sampling and should_compute_rollout_metrics):
+            rollout_per_token_logps = grpo_batch.rollout_per_token_logps
+
+            rollout_correction_metrics = self._compute_rollout_offpolicy_metrics(old_per_token_logps,
+                                                                                 rollout_per_token_logps,
+                                                                                 completion_mask)
+
+            rollout_log_ratio, rollout_is_weights = self._get_rollout_is_correction(old_per_token_logps,
+                                                                                    rollout_per_token_logps,
+                                                                                    completion_mask)
+            if rollout_log_ratio is not None:
+                is_metrics = self._compute_is_correction_metrics(rollout_log_ratio, rollout_is_weights, completion_mask)
+                rollout_correction_metrics.update(is_metrics)
+
+            pass
+
+        log_ratio = per_token_logps - old_per_token_logps
+        if self.importance_sampling_level == 'token':
+            log_importance_weights = log_ratio
+        elif self.importance_sampling_level in ['sequence', 'sequence_token']:
+            seq_level_log_weights = ((log_ratio * completion_mask).sum(-1)
+                                     / completion_mask.sum(-1).clamp(min=1.0)).unsqueeze(-1)
+            if self.importance_sampling_level == 'sequence':
+                log_importance_weights = seq_level_log_weights
+            else:
+                # GSPO-token: sg[si(θ)] * πθ(yi,t)/sg[πθ(yi,t)]
+                seq_level_log_weight = seq_level_log_weights.detach()
+                log_importance_weights = per_token_logps - per_token_logps.detach() + seq_level_log_weight
+        else:
+            raise ValueError(
+                f"Unknown importance sampling level: {self.importance_sampling_level}. Possible values are 'token' "
+                "and 'sequence'.")
+
+        coef_1 = torch.exp(log_importance_weights)
+
+        # Teacher advantages are per-token; sequence-only loss types are unsupported with a teacher.
+        if self._has_teacher and (self.loss_type in ['real', 'fipo']
+                                  or self.off_policy_sequence_mask_delta is not None):
+            raise ValueError(f'OPD-RL (teacher) does not support loss_type={self.loss_type!r} / '
+                             'off_policy_sequence_mask.')
+
+        fipo_metrics = None
+        if self.loss_type == 'cispo':
+            clamped_ratios = torch.clamp(coef_1, max=self.epsilon_high).detach()
+            per_token_loss = -clamped_ratios * advantages * per_token_logps
+        elif self.loss_type == 'sapo':
+            gate_pos = torch.sigmoid(self.tau_pos * (coef_1 - 1)) * (4.0 / self.tau_pos)
+            gate_neg = torch.sigmoid(self.tau_neg * (coef_1 - 1)) * (4.0 / self.tau_neg)
+            is_positive = advantages > 0
+            soft_gate = torch.where(is_positive, gate_pos, gate_neg)
+
+            per_token_loss = -soft_gate * advantages
+        elif self.loss_type == 'real':
+            per_token_loss = torch.zeros_like(per_token_logps)
+        elif self.loss_type in ['grpo', 'bnpo', 'dr_grpo', 'dapo', 'fipo']:
+            if self.loss_type == 'fipo':
+                fipo_weight, fipo_metrics = self._compute_fipo_influence(log_ratio, coef_1, advantages, completion_mask)
+
+            coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
+            if self.args.delta is not None:
+                coef_1 = torch.clamp(coef_1, max=self.args.delta)
+
+            per_token_loss1 = coef_1 * advantages
+            per_token_loss2 = coef_2 * advantages
+            per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+            if self.loss_type == 'fipo':
+                per_token_loss = per_token_loss * fipo_weight
+        if entropy_mask is not None:
+            per_token_loss = per_token_loss * entropy_mask
+        if per_token_kl is not None:
+            per_token_loss = per_token_loss + self.beta * per_token_kl
+
+        if rollout_is_weights is not None and self.rollout_importance_sampling_mode is not None:
+            per_token_loss = per_token_loss * rollout_is_weights
+
+        if self.off_policy_sequence_mask_delta is not None:
+            old_policy_per_token_logps = (
+                grpo_batch.rollout_per_token_logps
+                if grpo_batch.rollout_per_token_logps is not None else old_per_token_logps)
+            # Without a teacher, the token-broadcast advantage reduces to one scalar per sequence.
+            seq_advantages = (advantages * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+            off_policy_seq_mask = self._compute_off_policy_sequence_mask(per_token_logps, old_policy_per_token_logps,
+                                                                         completion_mask, seq_advantages)
+            off_policy_seq_mask_expanded = off_policy_seq_mask.unsqueeze(-1).expand_as(completion_mask)
+            completion_mask = completion_mask & off_policy_seq_mask_expanded
+
+        if self.loss_type in ['grpo', 'sapo', 'dr_grpo']:
+            # completion_mask is now always [batch_size, seq_len] after pad_back
+            denominator = (self.max_completion_length if self.loss_type == 'dr_grpo'
+                           else completion_mask.sum(-1).clamp(min=1.0))
+            sequence_loss = (per_token_loss * completion_mask).sum(-1) / denominator
+            if grpo_batch.sequence_loss_weights is not None:
+                sequence_loss = sequence_loss * grpo_batch.sequence_loss_weights
+            loss = sequence_loss.mean()
+        elif self.loss_type == 'bnpo':
+            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+        elif self.loss_type == 'real':
+            global_scores = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+
+            group_scores = global_scores.view(-1, self.num_generations)
+            # Reduce token-broadcast advantages for the per-sequence positive/negative split.
+            seq_advantages = (advantages * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+            group_rewards = seq_advantages.view(-1, self.num_generations)
+
+            pos_mask = (group_rewards > 0)
+            neg_mask = (group_rewards <= 0)
+            valid_mask = (pos_mask.sum(dim=1) != 0) & (neg_mask.sum(dim=1) != 0)
+
+            if not valid_mask.any():
+                loss = torch.tensor(0., device=global_scores.device) * global_scores.mean()
+            else:
+                batch_scores = group_scores[valid_mask]
+                batch_pos_mask = pos_mask[valid_mask]
+                batch_neg_mask = neg_mask[valid_mask]
+
+                scaled_scores = batch_scores / self.real_tau
+                zeros = torch.zeros(batch_scores.size(0), 1, device=batch_scores.device, dtype=batch_scores.dtype)
+
+                # Negative Loss: log(1 + sum(e^{S_neg}))
+                neg_input = scaled_scores.masked_fill(~batch_neg_mask, float('-inf'))
+                neg_loss = torch.logsumexp(torch.cat([neg_input, zeros], dim=1), dim=1)
+
+                # Positive Loss: log(1 + sum(e^{-S_pos}))
+                pos_input = (-scaled_scores).masked_fill(~batch_pos_mask, float('-inf'))
+                pos_loss = torch.logsumexp(torch.cat([pos_input, zeros], dim=1), dim=1)
+
+                loss = (neg_loss + pos_loss).sum() / group_rewards.size(0)
+
+            if self.beta != 0.0:
+                kl_loss = (per_token_kl * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+                loss = loss + kl_loss * self.beta
+        elif self.loss_type in ['cispo', 'dapo', 'fipo']:
+            # CISPO, DAPO, and FIPO: Normalize by total completion tokens across all processes
+            normalizer = grpo_batch.num_items_in_batch / self.accelerator.num_processes
+            loss = (per_token_loss * completion_mask).sum() / normalizer
+        else:
+            raise ValueError(f'Unknown loss type: {self.loss_type}')
+
+        if self.mopd_branch_loss_coef > 0 and branch_completion_mask is not None:
+            branch_counts = branch_completion_mask.sum(-1)
+            active = branch_counts > 0
+            if active.any():
+                branch_nll = -(per_token_logps * branch_completion_mask).sum(-1) / branch_counts.clamp(min=1.0)
+                branch_loss = branch_nll[active].mean()
+                loss = loss + self.mopd_branch_loss_coef * branch_loss
+                self._metrics[mode]['mopd/branch_loss'].append(branch_loss.detach().item())
+                self._metrics[mode]['mopd/branch_token_ratio'].append(
+                    (branch_completion_mask.sum() / grpo_batch.completion_mask.sum().clamp(min=1.0)).item())
+                self._metrics[mode]['mopd/branch_loss_coef'].append(self.mopd_branch_loss_coef)
+
+        # SDAR adds a confidence-gated loss using current student logps and detached, aligned teacher logps.
+        if self.sdar_loss_coef > 0 and grpo_batch.teacher_per_token_logps is not None:
+            sdar_loss, sdar_metrics = compute_sdar_loss(
+                student_log_probs=per_token_logps,
+                teacher_log_probs=grpo_batch.teacher_per_token_logps,
+                response_mask=completion_mask,
+                gate_beta=self.sdar_gate_beta,
+            )
+            loss = loss + self.sdar_loss_coef * sdar_loss
+            for _sdar_key, _sdar_val in sdar_metrics.items():
+                self._metrics[mode][_sdar_key].append(_sdar_val)
+            self._metrics[mode]['sdar/coef'].append(self.sdar_loss_coef)
+
+        completion_token_count = completion_mask.sum().clamp(min=1.0)
+
+        def masked_batch_mean(x):
+            # compute for token-level average
+            if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
+                return x.mean()
+            else:
+                return (x * completion_mask).sum() / completion_token_count
+
+        metrics_data = {
+            'mode': mode,
+            'entropy': entropy_metrics,
+            'completion_mask': completion_mask,
+            'completion_token_count': completion_token_count,
+        }
+
+        if fipo_metrics is not None:
+            fipo_future_kl = masked_batch_mean(fipo_metrics['future_kl'])
+            fipo_influence_weight = masked_batch_mean(fipo_metrics['influence_weight'])
+            fipo_safety_keep = masked_batch_mean(fipo_metrics['safety_mask'].float())
+            metrics_data['fipo'] = {
+                'future_kl_mean': self.accelerator.gather_for_metrics(fipo_future_kl).nanmean().item(),
+                'influence_weight_mean': self.accelerator.gather_for_metrics(fipo_influence_weight).nanmean().item(),
+                'safety_keep_ratio': self.accelerator.gather_for_metrics(fipo_safety_keep).nanmean().item(),
+            }
+
+        if per_token_kl is not None:
+            mean_kl = masked_batch_mean(per_token_kl)
+            metrics_data['kl'] = self.accelerator.gather_for_metrics(mean_kl).nanmean().item()
+
+        if rollout_correction_metrics:
+            metrics_data['rollout_correction'] = rollout_correction_metrics
+
+        if self.loss_type == 'cispo':
+            # CISPO: Only track upper bound clipping
+            is_cispo_clipped = (coef_1 > self.epsilon_high) & (advantages > 0)
+            cispo_clip_ratio = masked_batch_mean(is_cispo_clipped.float())
+            gathered_cispo_clip_ratio = self.accelerator.gather_for_metrics(cispo_clip_ratio)
+            metrics_data['clipping'] = {'cispo_clip_ratio': gathered_cispo_clip_ratio.nanmean().item()}
+        elif self.loss_type in ['sapo', 'real']:
+            pass
+        else:
+            is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages < 0)
+            is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages > 0)
+            is_region_clipped = is_low_clipped | is_high_clipped
+
+            low_clip = masked_batch_mean(is_low_clipped.float())
+            high_clip = masked_batch_mean(is_high_clipped.float())
+            clip_ratio = masked_batch_mean(is_region_clipped.float())
+
+            gathered_low_clip = self.accelerator.gather_for_metrics(low_clip)
+            gathered_high_clip = self.accelerator.gather_for_metrics(high_clip)
+            gathered_clip_ratio = self.accelerator.gather_for_metrics(clip_ratio)
+
+            metrics_data['clipping'] = {
+                'low_clip_mean': gathered_low_clip.nanmean().item(),
+                'low_clip_min': nanmin(gathered_low_clip).item(),
+                'high_clip_mean': gathered_high_clip.nanmean().item(),
+                'high_clip_max': nanmax(gathered_high_clip).item(),
+                'region_clip_mean': gathered_clip_ratio.nanmean().item()
+            }
+        if mode == 'train' and self.chord_sft_iterator is not None:
+            loss = compute_chord_loss(self, grpo_loss=loss)
+
+        if mode == 'train':
+            _report_nonfinite_loss(
+                self, loss, completion_mask, model_inputs, {
+                    'per_token_logps': per_token_logps,
+                    'old_per_token_logps': grpo_batch.old_per_token_logps,
+                    'ref_per_token_logps': grpo_batch.ref_per_token_logps,
+                    'rollout_per_token_logps': grpo_batch.rollout_per_token_logps,
+                    'advantages': advantages,
+                    'coef_1': coef_1,
+                    'per_token_kl': per_token_kl,
+                    'rollout_is_weights': rollout_is_weights,
+                    'per_token_loss': per_token_loss,
+                    'sequence_loss_weights': grpo_batch.sequence_loss_weights,
+                })
+        return loss, metrics_data
+
+    def _update_metrics(self, metrics_data):
+        """Update metrics from metrics_data."""
+        mode = metrics_data['mode']
+
+        if metrics_data['entropy']:
+            entropy_metrics = metrics_data['entropy']
+            if 'entropy_logs' in entropy_metrics:
+                self._logs['entropy'].extend(entropy_metrics['entropy_logs'])
+                self._metrics[mode]['entropy/mean'].append(entropy_metrics['entropy_mean'])
+                self._metrics[mode]['entropy/max'].append(entropy_metrics['entropy_max'])
+                self._metrics[mode]['entropy/min'].append(entropy_metrics['entropy_min'])
+            if 'entropy_threshold' in entropy_metrics:
+                self._metrics[mode]['entropy/threshold'].append(entropy_metrics['entropy_threshold'])
+
+        if 'kl' in metrics_data:
+            self._metrics[mode]['kl'].append(metrics_data['kl'])
+
+        if 'rollout_correction' in metrics_data:
+            rollout_metrics = metrics_data['rollout_correction']
+            for key, value in rollout_metrics.items():
+                self._metrics[mode][f'rollout_correction/{key}'].append(value)
+
+        if 'fipo' in metrics_data:
+            for key, value in metrics_data['fipo'].items():
+                self._metrics[mode][f'fipo/{key}'].append(value)
+
+        if 'clipping' in metrics_data:
+            clipping = metrics_data['clipping']
+            if 'cispo_clip_ratio' in clipping:
+                self._metrics[mode]['cispo_clip_ratio'].append(clipping['cispo_clip_ratio'])
+            else:
+                self._metrics[mode]['clip_ratio/low_mean'].append(clipping['low_clip_mean'])
+                self._metrics[mode]['clip_ratio/low_min'].append(clipping['low_clip_min'])
+                self._metrics[mode]['clip_ratio/high_mean'].append(clipping['high_clip_mean'])
+                self._metrics[mode]['clip_ratio/high_max'].append(clipping['high_clip_max'])
+                self._metrics[mode]['clip_ratio/region_mean'].append(clipping['region_clip_mean'])
+
+    def _compute_loss_chunked(self, model, model_inputs: Dict[str, Any], grpo_batch: GRPOBatch, origin_data=None):
+        """
+        Compute loss in **fixed-size chunks** to reduce peak GPU memory.
+
+        The function guarantees that **all ranks step through the same number of
+        chunks**, so that collective communication remain synchronized
+        even when local ``batch_size`` differs.
+        """
+        mode = 'train' if self.model.training else 'eval'
+        chunk_size = self.args.per_device_train_batch_size if mode == 'train' else self.args.per_device_eval_batch_size
+        batch_size = grpo_batch.seq_lengths.shape[0] if self.template.padding_free else model_inputs['input_ids'].shape[
+            0]
+
+        batch_sizes = gather_object([batch_size])
+        chunks_per_device = [(bs + chunk_size - 1) // chunk_size for bs in batch_sizes]
+        max_chunks = max(chunks_per_device)
+
+        new_chunk_size = (batch_size + max_chunks - 1) // max_chunks
+
+        losses, weights = [], []
+        all_metrics_data = []
+        chunk_model_inputs, chunk_grpo_batch = {}, None
+        for chunk_idx in range(max_chunks):
+            start_idx = chunk_idx * new_chunk_size
+            end_idx = min(start_idx + new_chunk_size, batch_size)
+
+            is_dummy = False
+            if start_idx < batch_size:
+                chunk_model_inputs, chunk_grpo_batch = self.get_chunked_inputs(model_inputs, grpo_batch, start_idx,
+                                                                               end_idx, origin_data)
+                chunk_weight = end_idx - start_idx
+            else:
+                is_dummy = True
+                chunk_weight = 0
+
+            # Dummy chunks align collectives but must not duplicate data in IS metrics.
+            self._is_dummy_loss_chunk = is_dummy
+            try:
+                chunk_loss, chunk_metrics_data = self._compute_loss_and_metrics(
+                    model, chunk_model_inputs, chunk_grpo_batch)
+            finally:
+                self._is_dummy_loss_chunk = False
+
+            if not is_dummy:
+                losses.append(chunk_loss * chunk_weight)
+                weights.append(chunk_weight)
+                all_metrics_data.append((chunk_metrics_data, chunk_weight))
+            else:
+                # Add dummy loss to trigger ZeRO-3 backward hooks.
+                losses.append(chunk_loss * 0.0)
+
+        total_weight = sum(weights)
+        if total_weight > 0:
+            final_loss = torch.stack(losses).sum() / total_weight
+        else:
+            final_loss = torch.stack(losses).sum()
+
+        self._aggregate_and_update_metrics(all_metrics_data, mode)
+
+        return final_loss
+
+    def _aggregate_and_update_metrics(self, all_metrics_data, mode):
+        """Aggregate metrics from multiple chunks and update global metrics."""
+        if not all_metrics_data:
+            return
+
+        entropy_logs, entropy_stats, kl_values = [], [], []
+        clip_values = {'low': [], 'high': [], 'region': [], 'low_min': [], 'high_max': []}
+        cispo_clip_values = []
+        entropy_thresholds = []
+        fipo_values = {}
+        rollout_values = {}
+
+        for chunk_metrics, chunk_weight in all_metrics_data:
+            chunk_tokens = chunk_metrics['completion_token_count']
+            for key, value in chunk_metrics.get('rollout_correction', {}).items():
+                weight = chunk_tokens if key in {'kl', 'k3_kl', 'chi2_token', 'is_weight_mean'} else chunk_weight
+                weight = weight.item() if hasattr(weight, 'item') else weight
+                rollout_values.setdefault(key, []).append((value, weight))
+
+            if chunk_metrics['entropy']:
+                entropy_metrics = chunk_metrics['entropy']
+                if 'entropy_logs' in entropy_metrics:
+                    entropy_logs.extend(entropy_metrics['entropy_logs'])
+                    entropy_stats.append({
+                        'mean': entropy_metrics['entropy_mean'],
+                        'max': entropy_metrics['entropy_max'],
+                        'min': entropy_metrics['entropy_min']
+                    })
+                if 'entropy_threshold' in entropy_metrics:
+                    entropy_thresholds.append(entropy_metrics['entropy_threshold'])
+
+            if 'kl' in chunk_metrics:
+                kl_values.append(chunk_metrics['kl'])
+
+            if 'fipo' in chunk_metrics:
+                weight = chunk_tokens.item() if hasattr(chunk_tokens, 'item') else chunk_tokens
+                for key, value in chunk_metrics['fipo'].items():
+                    fipo_values.setdefault(key, []).append((value, weight))
+
+            if 'clipping' in chunk_metrics:
+                clipping = chunk_metrics['clipping']
+                weight = chunk_tokens.item() if hasattr(chunk_tokens, 'item') else chunk_tokens
+                if 'cispo_clip_ratio' in clipping:
+                    cispo_clip_values.append((clipping['cispo_clip_ratio'], weight))
+                else:
+                    clip_values['low'].append((clipping['low_clip_mean'], weight))
+                    clip_values['high'].append((clipping['high_clip_mean'], weight))
+                    clip_values['region'].append((clipping['region_clip_mean'], weight))
+                    clip_values['low_min'].append(clipping['low_clip_min'])
+                    clip_values['high_max'].append(clipping['high_clip_max'])
+
+        aggregated_metrics = {'mode': mode, 'entropy': {}}
+
+        if entropy_logs:
+            aggregated_metrics['entropy'] = {
+                'entropy_logs': entropy_logs,
+                'entropy_mean': sum(s['mean'] for s in entropy_stats) / len(entropy_stats),
+                'entropy_max': max(s['max'] for s in entropy_stats),
+                'entropy_min': min(s['min'] for s in entropy_stats)
+            }
+        if entropy_thresholds:
+            aggregated_metrics['entropy']['entropy_threshold'] = sum(entropy_thresholds) / len(entropy_thresholds)
+
+        if kl_values:
+            aggregated_metrics['kl'] = sum(kl_values) / len(kl_values)
+
+        def weighted_avg(values):
+            return sum(v * w for v, w in values) / sum(w for _, w in values)
+
+        if cispo_clip_values:
+            aggregated_metrics['clipping'] = {'cispo_clip_ratio': weighted_avg(cispo_clip_values)}
+        elif clip_values['low']:
+            aggregated_metrics['clipping'] = {
+                'low_clip_mean': weighted_avg(clip_values['low']),
+                'low_clip_min': min(clip_values['low_min']),
+                'high_clip_mean': weighted_avg(clip_values['high']),
+                'high_clip_max': max(clip_values['high_max']),
+                'region_clip_mean': weighted_avg(clip_values['region'])
+            }
+
+        if fipo_values:
+            aggregated_metrics['fipo'] = {key: weighted_avg(values) for key, values in fipo_values.items()}
+        if rollout_values:
+            aggregated_metrics['rollout_correction'] = {
+                key: (max(value for value, _ in values) if key.endswith('_max')
+                      else min(value for value, _ in values) if key.endswith('_min') else weighted_avg(values))
+                for key, values in rollout_values.items()
+            }
+
+        self._update_metrics(aggregated_metrics)
+
+    def _unpad_logps_and_entropies(self,
+                                   logps: torch.Tensor,
+                                   entropies: Optional[torch.Tensor],
+                                   logits_to_keep: int,
+                                   batch_size: int,
+                                   seq_lengths: torch.Tensor,
+                                   compute_entropy: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Restore logps and entropies from rmpad format [1, total_nnz] to batch format [batch_size, max_seq_len].
+
+        Args:
+            logps: Per-token log probabilities in rmpad format [1, total_nnz]
+            entropies: Per-token entropies in rmpad format [1, total_nnz] or None
+            logits_to_keep: Number of tokens to keep per sequence
+            batch_size: Number of sequences in the batch
+            seq_lengths: Actual sequence lengths [batch_size]
+            compute_entropy: Whether entropy was computed
+
+        Returns:
+            logps: Restored log probabilities [batch_size, logits_to_keep]
+            entropies: Restored entropies [batch_size, logits_to_keep] or None
+        """
+        logps, _ = pad_logps_back_to_batch(
+            logps_rmpad=logps, logits_to_keep=logits_to_keep, batch_size=batch_size, seq_lengths=seq_lengths)
+
+        if compute_entropy and entropies is not None:
+            entropies, _ = pad_logps_back_to_batch(
+                logps_rmpad=entropies, logits_to_keep=logits_to_keep, batch_size=batch_size, seq_lengths=seq_lengths)
+
+        return logps, entropies
+
+    def _get_logps_via_sp(self,
+                          model: torch.nn.Module,
+                          model_inputs: Dict[str, Any],
+                          grpo_batch: GRPOBatch,
+                          logits_to_keep: int,
+                          input_ids: torch.Tensor,
+                          compute_entropy: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Get per token logps via sequence parallel, returns rmpad format [1, total_nnz] for padding_free mode"""
+        sequence_parallel.prepare_inputs(model_inputs)
+        with self._template_context(self.template, model_inputs):
+            output = model(**model_inputs)
+            logits = output.logits
+        # split input_ids to labels
+        position_ids = sequence_parallel.real_position_ids
+        _, _, labels, _, _, _, _ = sequence_parallel.pad_and_split_inputs(
+            None, None, input_ids.clone(), None, None, None, real_position_ids=position_ids)
+
+        labels = torch.where(labels == -100, self.processing_class.pad_token_id, labels)
+        logits = logits / self.temperature
+        per_token_logps = selective_log_softmax(logits, labels)
+        entropies = None
+        per_token_logps, _ = GatherLoss.apply(per_token_logps, labels, 1, position_ids)
+        if compute_entropy:
+            entropies = entropy_from_logits(logits.detach())
+            entropies, _ = GatherLoss.apply(entropies, labels, 1, position_ids)
+
+        if self.template.padding_free:
+            # Ring parallel pads each sequence separately; ordinary SP pads only the full sequence tail.
+            seq_lengths = grpo_batch.seq_lengths
+            batch_size = seq_lengths.shape[0]
+            rp_world_size = sequence_parallel.rp_world_size
+
+            if rp_world_size > 1:
+                # Gathered layout: [seq1, padding1, seq2, padding2, ...].
+
+                cu_seqlens_orig = get_cu_seqlens_from_position_ids(position_ids)
+
+                padded_position_ids = sequence_parallel.pad(position_ids, padding_value=-1, position_ids=position_ids)
+                cu_seqlens_padded = get_cu_seqlens_from_position_ids(padded_position_ids)
+
+                result_logps = []
+                result_entropies = [] if compute_entropy else None
+                gathered_logps = per_token_logps.squeeze(0)
+                gathered_entropies = entropies.squeeze(0) if compute_entropy else None
+
+                offset = 0
+                for i in range(batch_size):
+                    orig_len = (cu_seqlens_orig[i + 1] - cu_seqlens_orig[i]).item()
+                    padded_len = (cu_seqlens_padded[i + 1] - cu_seqlens_padded[i]).item()
+                    actual_len = seq_lengths[i].item()
+
+                    # The label shift maps completion positions [prompt_len, total_len)
+                    # to logprob positions [prompt_len-1, total_len-1).
+                    seq_start = offset + orig_len - actual_len - 1
+                    seq_end = offset + orig_len - 1
+                    result_logps.append(gathered_logps[seq_start:seq_end])
+                    if compute_entropy:
+                        result_entropies.append(gathered_entropies[seq_start:seq_end])
+
+                    offset += padded_len
+
+                per_token_logps = torch.cat(result_logps).unsqueeze(0)
+                if compute_entropy:
+                    entropies = torch.cat(result_entropies).unsqueeze(0)
+            else:
+                # Without ring parallel, padding appears only after the original input length.
+                original_total_len = input_ids.shape[-1]
+                # Due to label shifting (roll -1), per_token_logps[i] predicts token i+1.
+                start_idx = original_total_len - logits_to_keep - 1
+                end_idx = original_total_len - 1
+                per_token_logps = per_token_logps[:, start_idx:end_idx]
+                if compute_entropy:
+                    entropies = entropies[:, start_idx:end_idx]
+        else:
+            per_token_logps = per_token_logps[:, -logits_to_keep - 1:-1]
+            if compute_entropy:
+                entropies = entropies[:, -logits_to_keep - 1:-1]
+
+        return per_token_logps, entropies
+
+    def _get_logps_via_local_forward(self,
+                                     model: torch.nn.Module,
+                                     model_inputs: Dict[str, Any],
+                                     logits_to_keep: int,
+                                     input_ids: torch.Tensor,
+                                     compute_entropy: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Get per token logps via local forward pass, returns rmpad format [1, total_nnz] for padding_free mode"""
+        if 'logits_to_keep' in self.model_kwarg_keys:
+            model_inputs['logits_to_keep'] = logits_to_keep + 1
+
+        logits = model(**model_inputs).logits
+
+        logits = logits[:, -(logits_to_keep + 1):-1, :]
+        logits.div_(self.temperature)
+
+        input_ids_for_logps = input_ids[:, -logits_to_keep:]
+
+        is_padding_free = self.template.padding_free
+        if is_padding_free:
+            logits_rmpad = logits.squeeze(0)  # [total_nnz, vocab_size]
+            input_ids_rmpad = input_ids_for_logps.squeeze(0)  # [total_nnz]
+
+            logps = selective_log_softmax(logits_rmpad, input_ids_rmpad)  # [total_nnz]
+            logps = logps.unsqueeze(0)  # [1, total_nnz]
+
+            if compute_entropy:
+                entropies = entropy_from_logits(logits_rmpad.detach())  # [total_nnz]
+                entropies = entropies.unsqueeze(0)  # [1, total_nnz]
+            else:
+                entropies = None
+        else:
+            logps = selective_log_softmax(logits, input_ids_for_logps)
+            if compute_entropy:
+                entropies = entropy_from_logits(logits.detach())
+            else:
+                entropies = None
+
+        return logps, entropies
+
+    @profiling_decorator
+    def _get_per_token_logps_and_entropies(self,
+                                           model,
+                                           model_inputs: Dict[str, Any],
+                                           grpo_batch: GRPOBatch,
+                                           compute_entropy=False,
+                                           origin_data=None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Compute per-token log probabilities and entropies with memory-efficient batching.
+
+        When rollout count is larger than expected, we process in smaller batches
+        to control memory usage.
+        """
+        batch_size = grpo_batch.seq_lengths.shape[0] if self.template.padding_free else model_inputs['input_ids'].shape[
+            0]
+        mode = 'train' if self.model.training else 'eval'
+        expected_bs = self.args.per_device_train_batch_size if mode == 'train' else self.args.per_device_eval_batch_size  # noqa
+        if _local_nograd_chunking(self):
+            # No-grad scoring has no collectives, so ranks need not agree on chunking.
+            should_chunk = self.dynamic_num_samples and batch_size > expected_bs
+        else:
+            should_chunk = self.dynamic_num_samples and any(gather_object([batch_size > expected_bs]))
+        if not should_chunk:
+            return self._get_per_token_logps_and_entropies_single(
+                model, model_inputs, grpo_batch, compute_entropy=compute_entropy)
+        else:
+            return self._get_per_token_logps_and_entropies_chunked(
+                model, model_inputs, grpo_batch, compute_entropy=compute_entropy, origin_data=origin_data)
+
+    def _get_per_token_logps_and_entropies_single(self,
+                                                  model,
+                                                  model_inputs: Dict[str, Any],
+                                                  grpo_batch: GRPOBatch,
+                                                  compute_entropy=False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        logits_to_keep = grpo_batch.logits_to_keep
+        input_ids = model_inputs['input_ids']
+        is_padding_free = self.template.padding_free
+        use_sp = self.template.sequence_parallel_size > 1
+
+        if is_padding_free:
+            original_seq_lengths = grpo_batch.seq_lengths
+            batch_size = original_seq_lengths.shape[0]
+
+        if use_sp:
+            # SP returns [1, logits_to_keep] in padding-free mode, else [batch_size, logits_to_keep].
+            logps, entropies = self._get_logps_via_sp(
+                model, model_inputs, grpo_batch, logits_to_keep, input_ids, compute_entropy=compute_entropy)
+        else:
+            # Local forward returns [1, total_nnz] in padding-free mode, else [batch_size, logits_to_keep].
+            logps, entropies = self._get_logps_via_local_forward(
+                model, model_inputs, logits_to_keep, input_ids, compute_entropy=compute_entropy)
+
+        if is_padding_free:
+            logps, entropies = self._unpad_logps_and_entropies(logps, entropies, logits_to_keep, batch_size,
+                                                               original_seq_lengths, compute_entropy)
+
+        return logps, entropies
+
+    def _get_per_token_logps_and_entropies_chunked(self,
+                                                   model,
+                                                   model_inputs: Dict[str, Any],
+                                                   grpo_batch: GRPOBatch,
+                                                   compute_entropy=False,
+                                                   origin_data=None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Compute per-token log-probabilities (and optionally entropies) in **fixed-size
+        chunks** to bound peak GPU memory.
+
+        This routine **guarantees that every rank executes the same number of
+        chunks**, even when the local batch sizes differ.
+
+        Parameters
+        ----------
+        model : torch.nn.Module
+            The model used to compute log-probs and entropies.
+        model_inputs : Dict[str, Any]
+            Clean model-forward kwargs (input_ids, attention_mask, etc.).
+        grpo_batch : GRPOBatch
+            Batch-level RL signals (completion_mask, advantages, etc.).
+        compute_entropy : bool, optional
+            Whether to compute per-token entropies as well (default: False).
+        origin_data : list, optional
+            Original samples for multimodal re-encoding during chunking.
+
+        Returns
+        -------
+        final_logps : torch.Tensor
+            Concatenated per-token log-probabilities for the **entire batch**.
+        final_entropies : torch.Tensor or None
+            Concatenated per-token entropies, or ``None`` if ``compute_entropy`` is
+            ``False``.
+        """
+        batch_size = grpo_batch.seq_lengths.shape[0] if self.template.padding_free else model_inputs['input_ids'].shape[
+            0]
+        mode = 'train' if self.model.training else 'eval'
+        chunk_size = self.args.per_device_train_batch_size if mode == 'train' else self.args.per_device_eval_batch_size
+        # Backward chunk counts must match across ranks for ZeRO reductions; no-grad counts may differ.
+        batch_sizes = [batch_size] if _local_nograd_chunking(self) else gather_object([batch_size])  # list[int]
+        chunks_per_device = [(bs + chunk_size - 1) // chunk_size for bs in batch_sizes]
+        max_chunks = max(chunks_per_device)
+
+        new_chunk_size = (batch_size + max_chunks - 1) // max_chunks
+
+        all_logps, all_entropies = [], [] if compute_entropy else None
+
+        chunk_model_inputs, chunk_grpo_batch = {}, None
+        for chunk_idx in range(max_chunks):
+            start_idx = chunk_idx * new_chunk_size
+            end_idx = min(start_idx + new_chunk_size, batch_size)
+
+            if start_idx < end_idx:
+                chunk_model_inputs, chunk_grpo_batch = self.get_chunked_inputs(model_inputs, grpo_batch, start_idx,
+                                                                               end_idx, origin_data)
+
+            chunk_logps, chunk_entropies = self._get_per_token_logps_and_entropies_single(
+                model, chunk_model_inputs, chunk_grpo_batch, compute_entropy)
+
+            if start_idx < end_idx:
+                all_logps.append(chunk_logps)
+                if compute_entropy and chunk_entropies is not None:
+                    all_entropies.append(chunk_entropies)
+
+        final_logps = torch.cat(all_logps, dim=0)
+        final_entropies = torch.cat(all_entropies, dim=0) if all_entropies else None
+
+        return final_logps, final_entropies
+
+    @profiling_decorator
+    def _get_last_hidden_state(self, unwrapped_model, model_inputs, logits_to_keep):
+        if is_peft_model(unwrapped_model):
+            unwrapped_model = unwrapped_model.base_model.model
+        if not self.is_multimodal:
+            last_hidden_state = unwrapped_model.model(
+                input_ids=model_inputs['input_ids'], attention_mask=model_inputs['attention_mask']).last_hidden_state
+        else:
+            forward_inputs = dict(model_inputs)
+            if 'logits_to_keep' in self.model_kwarg_keys:
+                forward_inputs['logits_to_keep'] = logits_to_keep + 1
+
+            last_hidden_state = unwrapped_model.model(**forward_inputs).last_hidden_state
+
+        last_hidden_state = last_hidden_state[:, :-1, :]  # (B, L-1, H)
+        if logits_to_keep is not None:
+            last_hidden_state = last_hidden_state[:, -logits_to_keep:, :]  # (B, logits_to_keep, H)
+        return last_hidden_state
+
+    def _get_rollout_is_correction(self, old_per_token_logps, rollout_per_token_logps, completion_mask):
+        """Compute rollout importance sampling log-ratio and IS weights.
+
+        Returns:
+            (rollout_log_ratio, rollout_is_weights) if rollout IS correction is applicable,
+            (None, None) otherwise.
+        """
+        if self.rollout_importance_sampling_mode is None or self.disable_rollout_importance_sampling:
+            return None, None
+
+        rollout_log_ratio = old_per_token_logps - rollout_per_token_logps
+        rollout_is_weights = self._apply_rollout_importance_sampling(rollout_log_ratio, completion_mask)
+        return rollout_log_ratio, rollout_is_weights
+
+    def compute_liger_loss(self, unwrapped_model, model_inputs: Dict[str, Any], grpo_batch: GRPOBatch):
+        assert not self.template.padding_free
+        assert self.advantage_estimator == 'grpo'
+        input_ids = model_inputs['input_ids']
+        logits_to_keep = grpo_batch.logits_to_keep
+        completion_ids = input_ids[:, -logits_to_keep:]
+        completion_mask = grpo_batch.completion_mask
+
+        last_hidden_state = self._get_last_hidden_state(unwrapped_model, model_inputs, logits_to_keep)
+
+        old_per_token_logps = grpo_batch.old_per_token_logps
+        local_has = grpo_batch.rollout_per_token_logps is not None
+        vllm_is_ratio = None
+        if all(gather_object([local_has])):
+            _, vllm_is_ratio = self._get_rollout_is_correction(old_per_token_logps, grpo_batch.rollout_per_token_logps,
+                                                               completion_mask)
+
+        # LigerFusedLinearGRPOLoss expects [B]; expand_advantage_to_per_token always yields [B, T].
+        advantages = grpo_batch.advantages
+        advantages = (advantages * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+
+        loss, metrics = self.liger_grpo_loss(
+            _input=last_hidden_state,
+            lin_weight=unwrapped_model.lm_head.weight,
+            selected_token_ids=completion_ids,
+            attention_mask=completion_mask,
+            advantages=advantages,
+            bias=unwrapped_model.lm_head.bias,
+            old_per_token_logps=old_per_token_logps,
+            ref_per_token_logps=grpo_batch.ref_per_token_logps,
+            vllm_is_ratio=vllm_is_ratio,
+        )
+
+        mean_kl = metrics[0] if self.beta != 0.0 else None
+        clip_ratio = metrics[-1]
+
+        mode = 'eval' if self.control.should_evaluate else 'train'
+        if self.beta != 0.0:
+            self._metrics[mode]['kl'].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+        self._metrics[mode]['clip_ratio'].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
+        return loss
+
+    def evaluation_loop(self, dataloader, *args, **kwargs):
+        if self.args.async_generate:
+            while not self.is_async_generate_train_rollout_done():
+                time.sleep(0.1)
+        if self._queue.empty() and self.args.async_generate:
+            self._prefetch(dataloader)
+        self._eval_tool_ious = {'crop': [], 'select': []}
+        self._eval_tool_ious_called = {'crop': [], 'select': []}
+        output = super().evaluation_loop(dataloader, *args, **kwargs)
+        metric_key_prefix = kwargs.get('metric_key_prefix', 'eval')
+        for tool_name, values in self._eval_tool_ious.items():
+            if values:
+                output.metrics[f'{metric_key_prefix}_tool_iou/{tool_name}_mean'] = sum(values) / len(values)
+                output.metrics[f'{metric_key_prefix}_tool_iou/{tool_name}_median'] = statistics.median(values)
+                called_values = self._eval_tool_ious_called[tool_name]
+                output.metrics[f'{metric_key_prefix}_tool_iou/{tool_name}_call_coverage'] = (
+                    len(called_values) / len(values))
+                if called_values:
+                    output.metrics[f'{metric_key_prefix}_tool_iou/{tool_name}_called_mean'] = (
+                        sum(called_values) / len(called_values))
+                    output.metrics[f'{metric_key_prefix}_tool_iou/{tool_name}_called_median'] = (
+                        statistics.median(called_values))
+        self.eval_flag = True
+        return output
+
+    def training_step(self, model: nn.Module, inputs: DataType, num_items_in_batch=None) -> torch.Tensor:
+        loss = self._training_step_impl(model, inputs, num_items_in_batch)
+        attribution = getattr(self, '_grad_attribution', None)
+        if attribution is not None:
+            # DeepSpeed steps during the boundary micro-batch backward; read that step's guard norm.
+            optimizer = getattr(getattr(self, 'model_wrapped', None), 'optimizer', None)
+            boundary = bool(getattr(self.accelerator, 'sync_gradients', True))
+            encoded = getattr(self, '_grad_attribution_inputs', None)
+            self._grad_attribution_inputs = None
+            attribution.end_micro(encoded if encoded is not None else inputs, self.state.global_step + 1, boundary,
+                                  getattr(optimizer, 'swift_last_global_grad_norm', None))
+        return loss
+
+    def _training_step_impl(self, model: nn.Module, inputs: DataType, num_items_in_batch=None) -> torch.Tensor:
+        if self.args.async_generate:
+            while not self.is_async_generate_eval_rollout_done():
+                time.sleep(0.1)
+        target = os.environ.get('SWIFT_TORCH_PROFILE_AT', '')  # "global_step:micro_step"
+        if target and self.accelerator.is_main_process:
+            want_step, want_micro = (int(x) for x in target.split(':'))
+            micro = getattr(self, '_profile_micro_counter', 0)
+            self._profile_micro_counter = micro + 1
+            if self.state.global_step == want_step and micro % self.args.gradient_accumulation_steps == want_micro:
+                return self._profiled_training_step(model, inputs, num_items_in_batch)
+        if not os.environ.get('SWIFT_PROFILE_JSONL'):
+            return super().training_step(model, inputs, num_items_in_batch)
+        # Synchronize timing to include queued kernels and ZeRO gradient reductions.
+        torch.cuda.synchronize()
+        with profiling_context(self, 'training_step_synced'):
+            loss = super().training_step(model, inputs, num_items_in_batch)
+            torch.cuda.synchronize()
+        return loss
+
+    def _profiled_training_step(self, model, inputs, num_items_in_batch):
+        from torch.profiler import ProfilerActivity, profile
+        out_dir = os.path.dirname(os.environ.get('SWIFT_PROFILE_JSONL', '') or self.args.output_dir)
+        torch.cuda.synchronize()
+        wall_start = time.time()
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack=True) as prof:
+            loss = super().training_step(model, inputs, num_items_in_batch)
+            torch.cuda.synchronize()
+        wall = time.time() - wall_start
+        spans = sorted((e.time_range.start, e.time_range.end) for e in prof.events()
+                       if e.device_type == torch.autograd.DeviceType.CUDA)
+        busy, cur_s, cur_e = 0, None, None
+        for start, end in spans:
+            if cur_e is None or start > cur_e:
+                if cur_e is not None:
+                    busy += cur_e - cur_s
+                cur_s, cur_e = start, end
+            else:
+                cur_e = max(cur_e, end)
+        if cur_e is not None:
+            busy += cur_e - cur_s
+        with open(os.path.join(out_dir, 'torch_profile_step.txt'), 'w') as handle:
+            handle.write(f'wall={wall:.3f}s gpu_busy={busy / 1e6:.3f}s ({100 * busy / 1e6 / wall:.1f}%) '
+                         f'cuda_events={len(spans)}\n\n')
+            handle.write('== top by self CPU ==\n')
+            handle.write(prof.key_averages().table(sort_by='self_cpu_time_total', row_limit=40,
+                                                   max_name_column_width=80))
+            handle.write('\n== top by CUDA ==\n')
+            handle.write(prof.key_averages().table(sort_by='cuda_time_total', row_limit=25,
+                                                   max_name_column_width=80))
+            handle.write('\n== top self CPU grouped by python stack (depth 8) ==\n')
+            handle.write(prof.key_averages(group_by_stack_n=8).table(sort_by='self_cpu_time_total', row_limit=25,
+                                                                     max_name_column_width=80))
+        return loss
+
+    def old_policy(self):
+        if self.template.sequence_parallel_size == 1:
+            return (self.num_iterations > 1
+                    or self.args.gradient_accumulation_steps % self.args.steps_per_generation != 0)
+        else:
+            return (self.num_iterations > 1 or self.args.gradient_accumulation_steps %
+                    (self.args.steps_per_generation * sequence_parallel.world_size) != 0)
+
+    @contextmanager
+    def offload_context(self):
+        if self.args.offload_model:
+            self.offload_model(self.accelerator.unwrap_model(self.model))
+            if self.ref_model and not getattr(self.args, 'offload_ref_model', False):
+                self.offload_model(self.ref_model)
+        if getattr(self, 'optimizer', None) and self.args.offload_optimizer:
+            self.offload_optimizer()
+
+        try:
+            yield
+        finally:
+            if self.args.offload_model:
+                self.load_model(self.accelerator.unwrap_model(self.model))
+                if self.ref_model and not getattr(self.args, 'offload_ref_model', False):
+                    self.load_model(self.ref_model)
+            if getattr(self, 'optimizer', None) and self.args.offload_optimizer:
+                self.load_optimizer()
+
+    def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
+        mode = 'train' if self.model.training else 'eval'
+        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}
+
+        # Evaluation logs use an eval_ prefix.
+        if mode == 'eval':
+            metrics = {f'eval_{key}': val for key, val in metrics.items()}
+
+        logs.update(metrics)
+        if mode == 'train':
+            _log_nonfinite_guard(self, logs)
+
+        # Chunk/DDP entropy order differs from rollout order for split trajectories.
+        # Keep scalar entropy diagnostics, but never attach misaligned row values.
+        entropy_rows = 'entropy' in self._logs and not self.dynamic_num_samples
+        seen_nums = len(self._logs['entropy']) if entropy_rows else len(self._logs['prompt'])
+        if self.accelerator.is_main_process and self.log_completions:
+            table = {
+                'step': [str(self.state.global_step)] * seen_nums,
+                'prompt': list(self._logs['prompt'])[:seen_nums],
+                'completion': list(self._logs['completion'])[:seen_nums],
+                **{
+                    k: list(v)[:seen_nums]
+                    for k, v in self._logs['rewards'].items()
+                },
+                'advantages': list(self._logs['advantages'])[:seen_nums],
+            }
+            for key, value in self._logs.items():
+                if key not in table and key not in ['image', 'rewards', 'entropy']:
+                    table[key] = list(value)[:seen_nums]
+
+            if entropy_rows:
+                table.update({'entropy': list(self._logs['entropy'])[:seen_nums]})
+
+            report_to_wandb = self.args.report_to and 'wandb' in self.args.report_to and wandb.run is not None
+            report_to_swanlab = self.args.report_to and 'swanlab' in self.args.report_to and swanlab_get_run(
+            ) is not None
+
+            table = _select_final_trajectory_rows(table)
+            self.jsonl_writer.append(table)
+
+            if report_to_wandb:
+                import pandas as pd
+
+                # Create a copy to avoid modifying the original table used by other loggers.
+                wandb_table = table.copy()
+                if self._logs.get('image'):
+                    image_rows = {
+                        'image': list(self._logs['image'])[:seen_nums],
+                        **{key: list(self._logs[key])[:seen_nums]
+                           for key in ('request_id', 'training_turn_index', 'training_turn_count')},
+                    }
+                    wandb_table['image'] = [
+                        wandb.Image(load_pil_img(img)) if img is not None else None
+                        for img in _select_final_trajectory_rows(image_rows)['image']
+                    ]
+                df = pd.DataFrame(wandb_table)
+                if self.wandb_log_unique_prompts:
+                    df = df.drop_duplicates(subset=['prompt'])
+                wandb.log({'completions': wandb.Table(dataframe=df)}, commit=False)
+
+            if report_to_swanlab:
+                headers = list(table.keys())
+                rows = []
+                for i in range(len(table['step'])):
+                    row = []
+                    for header in headers:
+                        row.append(table[header][i])
+                    rows.append(row)
+                swanlab.log({'completions': swanlab.echarts.Table().add(headers, rows)})
+
+        if version.parse(transformers.__version__) >= version.parse('4.47.0.dev0'):
+            super().log(logs, start_time)
+        else:  # transformers<=4.46
+            super().log(logs)
+        self._metrics[mode].clear()
+
+    def is_async_generate_eval_rollout_done(self):
+        return not self.eval_flag or not self.eval_queue.empty()
+
+    def is_async_generate_train_rollout_done(self):
+        return not self.train_queue.empty()
+
+    def _gather_and_flatten(self, local_list, dtype=None, device=None, flatten_level: int = 1):
+        """
+        Gather data from all ranks with `gather_object` and flatten as required.
+
+        Args
+        ----
+        local_list : List[Any]
+            The per-rank data to be gathered. Can be any picklable structure.
+        dtype : torch.dtype, optional
+            If provided, the flattened result is converted to a tensor with this dtype.
+        device : torch.device, optional
+            Target device for the resulting tensor. Ignored if dtype is None.
+        flatten_level : int
+            0  keep the outer list of per-rank results: List[rank_data]
+            1  flatten across ranks: List[element]
+            2  flatten one more level (assumes rank_data is iterable): List[sub_element]
+
+        Returns
+        -------
+        Any
+            - List[Any] when dtype is None
+            - torch.Tensor when dtype is given
+        """
+        gathered = gather_object(local_list)
+
+        if flatten_level == 0:
+            flat = gathered
+        elif flatten_level == 1:
+            flat = [elem for rank_data in gathered for elem in rank_data]
+        elif flatten_level == 2:
+            flat = [item for rank_data in gathered for sublist in rank_data for item in sublist]
+        else:
+            raise ValueError(f'Invalid flatten_level: {flatten_level}')
+
+        if dtype is not None:
+            try:
+                return torch.tensor(flat, dtype=dtype, device=device)
+            except (TypeError, ValueError) as e:
+                raise RuntimeError(f'Cannot convert gathered+flattened data to tensor: {e}') from e
+        return flat
+
+    def _group_inputs_by_request_id(self, inputs: DataType) -> Dict[str, List[Dict]]:
+        """
+        Group inputs by request_id for multi-turn reward computation.
+
+        Args:
+            inputs: List of input dictionaries, each containing a 'request_id' field
+
+        Returns:
+            Dict[str, List[Dict]]: A dictionary where keys are request_ids and values are
+                                  lists of input dictionaries with the same request_id
+        """
+        inputs_by_request_id = {}
+
+        for input_data in inputs:
+            request_id = input_data.get('request_id')
+            if request_id is None:
+                continue
+
+            if request_id not in inputs_by_request_id:
+                inputs_by_request_id[request_id] = []
+
+            inputs_by_request_id[request_id].append(input_data)
+
+        return inputs_by_request_id
+
+    def _get_trajectory_inputs(self, samples: List[GRPOSample]) -> Dict[str, List[Dict]]:
+        current_request_ids = {sample.request_id for sample in samples}
+        local_inputs = [sample.to_reward_row() for sample in samples]
+        total_inputs = gather_object(local_inputs)
+        filtered_total_inputs = []
+        for rank_inputs in total_inputs:
+            candidate_inputs = [rank_inputs] if isinstance(rank_inputs, dict) else rank_inputs
+            for input_data in candidate_inputs:
+                if input_data.get('request_id') in current_request_ids:
+                    filtered_total_inputs.append(input_data)
+        return self._group_inputs_by_request_id(filtered_total_inputs)
+
+    def _get_last_indices(self, request_ids: List[str]) -> torch.Tensor:
+        seen = {}
+        for i, rid in enumerate(request_ids):
+            seen[rid] = i
+        return torch.tensor(list(seen.values()), dtype=torch.long, device=self.accelerator.device)
+
+    def get_chunked_inputs(self, model_inputs, grpo_batch, start_idx, end_idx, origin_data=None):
+        """Slice ``model_inputs`` and ``grpo_batch`` by batch dimension."""
+        chunk_model_inputs = {}
+        batch_size = grpo_batch.seq_lengths.shape[0] if self.template.padding_free else model_inputs['input_ids'].shape[
+            0]
+        for key, val in model_inputs.items():
+            if isinstance(val, torch.Tensor):
+                if val.ndim == 0:
+                    chunk_model_inputs[key] = val
+                elif self.is_multimodal and val.shape[0] != batch_size:
+                    continue
+                else:
+                    chunk_model_inputs[key] = val[start_idx:end_idx]
+            elif isinstance(val, list) and len(val) == batch_size:
+                chunk_model_inputs[key] = val[start_idx:end_idx]
+            else:
+                chunk_model_inputs[key] = val
+
+        chunk_grpo_batch = GRPOBatch(
+            completion_mask=grpo_batch.completion_mask[start_idx:end_idx],
+            truncated_mask=grpo_batch.truncated_mask[start_idx:end_idx],
+            seq_lengths=(grpo_batch.seq_lengths[start_idx:end_idx]
+                         if grpo_batch.seq_lengths.numel() > 0 else grpo_batch.seq_lengths),
+            old_per_token_logps=(grpo_batch.old_per_token_logps[start_idx:end_idx]
+                                 if grpo_batch.old_per_token_logps is not None else None),
+            ref_per_token_logps=(grpo_batch.ref_per_token_logps[start_idx:end_idx]
+                                 if grpo_batch.ref_per_token_logps is not None else None),
+            rollout_per_token_logps=(grpo_batch.rollout_per_token_logps[start_idx:end_idx]
+                                     if grpo_batch.rollout_per_token_logps is not None else None),
+            teacher_per_token_logps=(grpo_batch.teacher_per_token_logps[start_idx:end_idx]
+                                     if grpo_batch.teacher_per_token_logps is not None else None),
+            branch_token_mask=(grpo_batch.branch_token_mask[start_idx:end_idx]
+                               if grpo_batch.branch_token_mask is not None else None),
+            completion_turn_token_ids=(grpo_batch.completion_turn_token_ids[start_idx:end_idx]
+                                       if grpo_batch.completion_turn_token_ids is not None else None),
+            advantages=grpo_batch.advantages[start_idx:end_idx] if grpo_batch.advantages is not None else None,
+            num_items_in_batch=grpo_batch.num_items_in_batch,
+            sequence_loss_weights=(grpo_batch.sequence_loss_weights[start_idx:end_idx]
+                                   if grpo_batch.sequence_loss_weights is not None else None),
+            logits_to_keep=grpo_batch.logits_to_keep,
+        )
+
+        if self.is_multimodal and origin_data is not None:
+            chunk_origin_data = origin_data[start_idx:end_idx]
+            template = self.template
+            current_length = model_inputs['input_ids'].shape[1]
+            with self._template_context(template):
+                # Reuse sampled-token encodings; retokenizing decoded text can misalign masks, logps, and advantages.
+                encoded_data = []
+                for data in chunk_origin_data:
+                    encoded = dict(data.encoded) if data.encoded is not None else encode_sample(data, template)
+                    encoded.pop('_extra_kwargs', None)
+                    encoded_data.append(encoded)
+                chunk_model_inputs.update(
+                    to_device(template.data_collator(encoded_data, padding_to=current_length), self.accelerator.device))
+                chunk_model_inputs.pop('labels', None)
+
+        return chunk_model_inputs, chunk_grpo_batch
+
+    def _prepare_liger_loss(self):
+        self.use_liger_loss = self.args.use_liger_kernel
+        if self.use_liger_loss:
+            from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
+            self.liger_grpo_loss = LigerFusedLinearGRPOLoss(
+                beta=self.beta,
+                compiled=False,
+                epsilon_low=self.epsilon_low,
+                epsilon_high=self.epsilon_high,
+                temperature=self.temperature,
+                use_ref_model=self.beta != 0.0,
+                loss_type=self.loss_type,
+                max_completion_length=self.max_completion_length,
+                importance_sampling_level=self.importance_sampling_level,
+                sapo_temperature_pos=self.tau_pos,
+                sapo_temperature_neg=self.tau_neg,
+            )
+            self._forward_redirection = _ForwardRedirection()
+
+    def _prepare_metrics(self):
+        args = self.args
+        self._metrics = {'train': defaultdict(list), 'eval': defaultdict(list)}
+        self._eval_tool_ious = {'crop': [], 'select': []}
+        self._eval_tool_ious_called = {'crop': [], 'select': []}
+        self.log_completions = args.log_completions
+        self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
+        self.num_completions_to_print = args.num_completions_to_print
+        self.jsonl_writer = JsonlWriter(os.path.join(self.args.output_dir, 'completions.jsonl'))
+        self._logs = {
+            'prompt': deque(maxlen=args.generation_batch_size),
+            'completion': deque(maxlen=args.generation_batch_size),
+            'rewards': defaultdict(lambda: deque(maxlen=args.generation_batch_size)),
+            'advantages': deque(maxlen=args.generation_batch_size),
+        }
+        self.compute_entropy = self.args.log_entropy or self.top_entropy_quantile < 1.0
+        if self.args.log_entropy:
+            self._logs.update({'entropy': deque(maxlen=args.generation_batch_size)})
+
+    def _collect_config_info(self) -> Dict[str, str]:
+        config = {
+            'dynamic_sample': str(self.dynamic_sample),
+            'importance_sampling_level': str(self.importance_sampling_level),
+            'advantage_estimator': str(self.advantage_estimator),
+            'chord_sft_enabled': str(self.chord_sft_dataset is not None),
+            'offpolicy_sequence_mask': 'enable' if self.off_policy_sequence_mask_delta is not None else 'disable',
+            'rollout_importance_sampling': 'enable' if self.rollout_importance_sampling_mode is not None else 'disable',
+            'loss_type': str(self.loss_type),
+        }
+        return config
+
+    def _prepare_algorithm_params(self):
+        args = self.args
+        self.shuffle_dataset = args.dataset_shuffle
+
+        self.loss_type = args.loss_type
+        self.scale_rewards = args.scale_rewards
+
+        # GRPO, https://arxiv.org/abs/2402.03300
+        self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper, Multi-step
+
+        # DAPO, https://arxiv.org/abs/2503.14476
+        self.epsilon_low = args.epsilon
+        self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
+        self.dynamic_sample = args.dynamic_sample
+        self.max_resample_times = args.max_resample_times
+        self.overlong_filter = args.overlong_filter
+
+        # Entropy Mask, https://arxiv.org/abs/2506.01939
+        self.top_entropy_quantile = args.top_entropy_quantile
+
+        # GSPO, https://arxiv.org/abs/2507.18071
+        self.importance_sampling_level = args.importance_sampling_level
+
+        # SAPO, https://arxiv.org/abs/2511.20347
+        self.tau_pos = args.tau_pos
+        self.tau_neg = args.tau_neg
+
+        # REAL, https://arxiv.org/abs/2602.05630
+        self.real_tau = args.real_tau
+
+        # FIPO, https://arxiv.org/abs/2603.19835
+        self.fipo_gamma = 2**(-1 / args.fipo_decay_rate)
+        self.fipo_clip_range = args.fipo_clip_range
+        self.fipo_clip_high_only = args.fipo_clip_high_only
+        self.fipo_safety_threshold = args.fipo_safety_threshold
+
+        # RLOO,
+        self.advantage_estimator = args.advantage_estimator
+        self.kl_in_reward = args.kl_in_reward
+        if self.scale_rewards == 'gdpo' and self.kl_in_reward:
+            logger.warning('GDPO mode does not support kl_in_reward=True. Setting kl_in_reward=False.')
+            self.kl_in_reward = False
+
+        self.rollout_importance_sampling_mode = args.rollout_importance_sampling_mode
+        self.rollout_importance_sampling_threshold = args.rollout_importance_sampling_threshold
+        self.log_rollout_offpolicy_metrics = args.log_rollout_offpolicy_metrics
+
+        self.off_policy_sequence_mask_delta = args.off_policy_sequence_mask_delta
+
+        # RLSD (Self-Distilled RLVR), https://arxiv.org/abs/2604.03128
+        self.advantage_reweight = args.advantage_reweight
+        self.rlsd_lambda = args.rlsd_lambda
+        self.rlsd_reweight_clip_range = args.rlsd_reweight_clip_range
+        self.rlsd_lambda_warmup_steps = args.rlsd_lambda_warmup_steps
+        self.rlsd_lambda_decay_steps = args.rlsd_lambda_decay_steps
+        self.rlsd_negative_only = args.rlsd_negative_only
+
+        # SDAR (Self-Distilled Agentic RL), https://arxiv.org/abs/2605.15155
+        # Confidence-gated teacher distillation auxiliary loss (added to the GRPO policy loss).
+        self.sdar_loss_coef = args.sdar_loss_coef
+        self.sdar_gate_beta = args.sdar_gate_beta
+
+    def _rlsd_effective_lambda(self) -> float:
+        """RLSD lambda schedule (mirrors RLSD/verl/trainer/opsd_trainer.py:1952-1961).
+
+        With warmup: ramps 0 -> rlsd_lambda over ``rlsd_lambda_warmup_steps``.
+        With decay: after warmup, decays rlsd_lambda -> 0 over ``rlsd_lambda_decay_steps``.
+        Otherwise constant at ``rlsd_lambda``.
+        """
+        step = int(self.state.global_step)
+        warmup = self.rlsd_lambda_warmup_steps
+        decay = self.rlsd_lambda_decay_steps
+        target = self.rlsd_lambda
+        if warmup > 0 and step < warmup:
+            return target * (step / warmup)
+        if decay > 0 and step >= warmup:
+            decay_progress = (step - warmup) / decay
+            return target * max(1.0 - decay_progress, 0.0)
+        return target
+
+    def _prepare_chord_dataset(self):
+        # CHORD, https://arxiv.org/abs/2508.11408
+        self.chord_sft_iterator = None
+        if self.chord_sft_dataset:
+            self.chord_sft_iterator = make_chord_sft_dataset(self, self.chord_sft_dataset)
+
+    def _prepare_rewards(self, reward_funcs, reward_model=None, reward_templates=None):
+        args = self.args
+        device = self.accelerator.device
+
+        if not isinstance(reward_funcs, list):
+            reward_funcs = [reward_funcs]
+
+        if reward_funcs:
+            for i, reward_func in enumerate(reward_funcs):
+                if reward_func in orms:
+                    reward_func_class = orms[reward_func]
+                    reward_funcs[i] = reward_func_class(args=args)
+                elif not callable(reward_func):
+                    raise ValueError(f'reward_function {reward_func} is not implemented in swift.rewards')
+
+        self.reward_funcs = reward_funcs
+        self.reward_func_names = []
+        for reward_func in reward_funcs:
+            if inspect.isfunction(reward_func):
+                reward_func_name = reward_func.__name__
+            else:
+                reward_func_name = reward_func.__class__.__name__
+            self.reward_func_names.append(reward_func_name)
+
+        self.reward_model_plugins = [None] * len(self.reward_funcs)
+
+        if reward_model is not None:
+            reward_plugins = args.reward_model_plugin
+            if reward_plugins is None:
+                reward_plugins = ['default'] * len(reward_model)
+            assert len(reward_plugins) == len(reward_model), (
+                f"The number of 'reward_model_plugin' ({len(reward_plugins)}) does not match "
+                f"the number of 'reward_model' ({len(reward_model)}). "
+                "Please provide a corresponding 'reward_model_plugin' for each 'reward_model'.")
+            for rm, rm_plugin, rm_template in zip(reward_model, reward_plugins, reward_templates):
+                # Disable truncation here because encoding already applied the length limit.
+                rm_template.set_mode('train')
+                rm_template.max_length = None
+                if rm_plugin not in rm_plugins:
+                    raise ValueError(f'rm_plugin {rm_plugin} is not implemented in swift.rewards')
+                self.reward_model_plugins.append(rm_plugins[rm_plugin](model=rm, template=rm_template))
+                self.reward_funcs.append(rm)
+                self.reward_func_names.append(rm.config._name_or_path.split('/')[-1])
+
+        # Gym total_reward joins reward_funcs as an extra weighted reward column.
+        if self.use_gym_env:
+            self.reward_func_names.append('gym_reward')
+
+        if args.reward_weights is not None:
+            if len(args.reward_weights) != len(self.reward_func_names):
+                raise ValueError(f'Number of reward weights ({len(args.reward_weights)}) must match number of reward '
+                                 f'functions ({len(self.reward_func_names)})')
+            self.reward_weights = torch.tensor(args.reward_weights, dtype=torch.float32).to(device)
+        else:
+            self.reward_weights = torch.ones(len(self.reward_func_names), dtype=torch.float32).to(device)
+
+        for i, reward_func in enumerate(self.reward_funcs):
+            if isinstance(reward_func, PreTrainedModel):
+                if self.is_deepspeed_enabled:
+                    self.reward_funcs[i] = prepare_deepspeed(reward_func, self.accelerator)
+                elif self.is_fsdp_enabled:
+                    from .utils import prepare_fsdp
+                    self.reward_funcs[i] = prepare_fsdp(reward_func, self.accelerator)
+                else:
+                    self.reward_funcs[i] = self.accelerator.prepare_model(
+                        reward_func, evaluation_mode=True, device_placement=True)
+
+    def _prepare_resample_data_iterator(self):
+
+        def cyclic_iter(iterable):
+            while True:
+                for x in iterable:
+                    yield x
+
+        @contextmanager
+        def seed_context():
+            # Use a different seed to ensure the resample dataset does not overlap with train_dataset
+            seed = self.args.seed
+            self.args.seed = seed + 1
+            yield
+            self.args.seed = seed
+
+        with seed_context():
+            if self.args.dynamic_sample:
+                self.dynamic_resample_iterator = cyclic_iter(self.get_train_dataloader())
+
+            if self.template.truncation_strategy == 'raise':
+
+                @contextmanager
+                def single_sample_context():
+                    # Resample truncated data one item at a time.
+                    origin_ng = self.num_generations
+                    origin_gbs = self.args.generation_batch_size
+                    origin_spg = self.args.steps_per_generation
+                    try:
+                        self.num_generations = 1
+                        self.args.generation_batch_size = 1
+                        self.args.steps_per_generation = 1
+                        yield
+                    finally:
+                        self.num_generations = origin_ng
+                        self.args.generation_batch_size = origin_gbs
+                        self.args.steps_per_generation = origin_spg
+
+                with single_sample_context():
+                    self.truncated_resample_iterator = cyclic_iter(self.get_train_dataloader())
+
+    def _compute_sequence_level_ratios(self, is_ratio: torch.Tensor, completion_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Helper function to compute sequence-level importance sampling ratios.
+
+        Args:
+            is_ratio: Token-level IS ratios, shape [B, T]
+            completion_mask: Boolean mask for completion tokens, shape [B, T]
+
+        Returns:
+            Sequence-level ratios as geometric mean of token-level ratios
+        """
+        log_ratio = torch.log(is_ratio.clamp(min=1e-10))
+        seq_log_ratios = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+        seq_ratios = torch.exp(seq_log_ratios)
+
+        return seq_ratios
+
+    def _apply_rollout_importance_sampling(self, rollout_log_ratio: torch.Tensor,
+                                           completion_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Apply vLLM importance sampling correction using one of four modes.
+
+        Args:
+            rollout_log_ratio: log(π_θ / π_rollout) per token, shape [B, T]
+            completion_mask: Boolean mask for completion tokens, shape [B, T]
+
+        Returns:
+            IS weights to multiply with loss, same shape as rollout_log_ratio
+        """
+        mode = self.rollout_importance_sampling_mode
+        threshold = self.rollout_importance_sampling_threshold
+
+        # Clamp log-ratios to avoid overflow from padding values.
+        SAFETY_BOUND = 20.0
+        rollout_log_ratio_safe = torch.clamp(rollout_log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND)
+
+        is_ratio = torch.exp(rollout_log_ratio_safe)
+
+        if mode == 'token_truncate':
+            is_weights = torch.clamp(is_ratio, max=threshold)
+
+        elif mode == 'token_mask':
+            is_weights = torch.where(is_ratio <= threshold, is_ratio, torch.zeros_like(is_ratio))
+
+        elif mode == 'sequence_truncate':
+            seq_ratios = self._compute_sequence_level_ratios(is_ratio, completion_mask)
+            clipped_seq_ratios = torch.clamp(seq_ratios, max=threshold)
+
+            is_weights = clipped_seq_ratios.unsqueeze(-1).expand_as(is_ratio)
+
+        elif mode == 'sequence_mask':
+            seq_ratios = self._compute_sequence_level_ratios(is_ratio, completion_mask)
+            seq_mask = (seq_ratios <= threshold).float()
+
+            is_weights = is_ratio * seq_mask.unsqueeze(-1)
+        else:
+            return is_ratio
+
+        return is_weights
+
+    def _compute_off_policy_sequence_mask(
+        self,
+        per_token_logps: torch.Tensor,
+        old_policy_per_token_logps: torch.Tensor,
+        completion_mask: torch.Tensor,
+        advantages: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute off-policy sequence mask to filter out sequences that deviate too much
+        from the old/rollout policy AND have negative advantage.
+
+        This implements the Off-Policy Sequence Masking technique from DeepSeek-V3.2
+        (https://arxiv.org/abs/2512.02556). The mask filters sequences where:
+        1. mean(old_policy_logps - policy_logps) > off_policy_sequence_mask_delta
+        2. AND advantage < 0
+
+        Args:
+            per_token_logps: Log probs from current policy, shape [B, T]
+            old_policy_per_token_logps: Log probs from old/rollout policy, shape [B, T].
+                Uses rollout_per_token_logps if available, otherwise old_per_token_logps.
+            completion_mask: Boolean mask for completion tokens, shape [B, T]
+            advantages: Advantage values per sample, shape [B]
+
+        Returns:
+            Sequence mask, shape [B], True = keep sequence, False = mask out
+        """
+        # Positive delta means the old policy assigns higher probability.
+        log_ratio = old_policy_per_token_logps - per_token_logps
+
+        seq_mean_log_ratio = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+
+        exceeds_threshold = seq_mean_log_ratio > self.off_policy_sequence_mask_delta
+        negative_advantage = advantages < 0
+        should_mask = exceeds_threshold & negative_advantage
+
+        return ~should_mask
+
+    def _compute_rollout_offpolicy_metrics(
+        self,
+        per_token_logps: torch.Tensor,
+        rollout_per_token_logps: torch.Tensor,
+        completion_mask: torch.Tensor,
+    ) -> Dict[str, float]:
+        """
+        Compute off-policy diagnostic metrics (always computed for monitoring).
+
+        These metrics help diagnose the off-policy gap between rollout and training policies,
+        which can arise from policy mismatch (e.g., vLLM BF16 vs FSDP FP32), model staleness,
+        or general distribution shifts.
+
+        Key metrics:
+        - kl: Direct KL divergence estimator KL(π_rollout || π_training)
+        - k3_kl: K3 KL estimator for stability (more stable for small KL)
+        - training_ppl: Perplexity of training policy
+        - rollout_ppl: Perplexity of rollout policy
+        - log_ppl_diff: Difference in log perplexities
+        - ppl_ratio: Ratio of training PPL to rollout PPL
+        - chi2_token: Token-level χ² divergence E[ρ²] - 1
+        - chi2_seq: Mean squared geometric-mean token ratio minus one (not a sequence χ² divergence)
+
+        Args:
+            per_token_logps: Log probs from training policy model, shape [B, T]
+            rollout_per_token_logps: Log probs from rollout policy, shape [B, T]
+            completion_mask: Boolean mask for completion tokens, shape [B, T]
+
+        Returns:
+            Dictionary with off-policy diagnostic metrics
+        """
+        SAFETY_BOUND = 20.0
+        metrics = {}
+
+        def masked_mean(x, mask, axis=None):
+            if axis is None:
+                return (x * mask).sum() / mask.sum().clamp(min=1.0)
+            else:
+                return (x * mask).sum(axis) / mask.sum(axis).clamp(min=1.0)
+
+        mean_log_prob_training = masked_mean(per_token_logps, completion_mask, axis=-1)  # (batch_size,)
+        training_ppl = torch.exp(-mean_log_prob_training).mean()
+        metrics['training_ppl'] = self.accelerator.gather_for_metrics(training_ppl).nanmean().item()
+
+        metrics['training_log_ppl'] = self.accelerator.gather_for_metrics(
+            (-mean_log_prob_training).mean()).nanmean().item()
+
+        # KL estimates use rollout samples and the direction KL(rollout || training).
+
+        log_ratio = per_token_logps - rollout_per_token_logps
+        log_ratio *= completion_mask
+
+        kl = masked_mean(-log_ratio, completion_mask)
+        metrics['kl'] = self.accelerator.gather_for_metrics(kl).nanmean().item()
+
+        log_ratio_safe = torch.clamp(log_ratio, min=-20, max=20)
+        k3_kl_matrix = torch.clamp(torch.exp(log_ratio_safe) - log_ratio_safe - 1, min=-10, max=10)
+        k3_kl = masked_mean(k3_kl_matrix, completion_mask)
+        metrics['k3_kl'] = self.accelerator.gather_for_metrics(k3_kl).nanmean().item()
+
+        mean_log_prob_rollout = masked_mean(rollout_per_token_logps, completion_mask, axis=-1)  # (batch_size,)
+        rollout_ppl = torch.exp(-mean_log_prob_rollout).mean()
+        metrics['rollout_ppl'] = self.accelerator.gather_for_metrics(rollout_ppl).nanmean().item()
+        metrics['rollout_log_ppl'] = self.accelerator.gather_for_metrics(
+            (-mean_log_prob_rollout).mean()).nanmean().item()
+
+        log_ppl_diff = mean_log_prob_rollout - mean_log_prob_training
+        metrics['log_ppl_diff'] = self.accelerator.gather_for_metrics(log_ppl_diff.mean()).nanmean().item()
+        metrics['log_ppl_abs_diff'] = self.accelerator.gather_for_metrics(log_ppl_diff.abs().mean()).nanmean().item()
+        metrics['log_ppl_diff_max'] = self.accelerator.gather_for_metrics(log_ppl_diff.max()).max().item()
+        metrics['log_ppl_diff_min'] = self.accelerator.gather_for_metrics(log_ppl_diff.min()).min().item()
+
+        # Average per-sequence PPL ratios, rather than taking a ratio of mean perplexities.
+        ppl_ratio = torch.exp(log_ppl_diff).mean()
+        metrics['ppl_ratio'] = self.accelerator.gather_for_metrics(ppl_ratio).nanmean().item()
+
+        log_ratio_safe = torch.clamp(log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND)
+        rho_token = torch.exp(log_ratio_safe)
+        rho_squared_token = rho_token.square()
+        chi2_token = masked_mean(rho_squared_token, completion_mask) - 1.0
+        metrics['chi2_token'] = self.accelerator.gather_for_metrics(chi2_token).nanmean().item()
+
+        # Geometric-mean IS weights normalize the sequence statistic for length.
+        log_ratio_mean = masked_mean(log_ratio, completion_mask, axis=-1)
+        log_ratio_mean_safe = torch.clamp(log_ratio_mean, min=-SAFETY_BOUND, max=SAFETY_BOUND)
+        rho_geo = torch.exp(log_ratio_mean_safe)
+        chi2_seq = (rho_geo.square().mean() - 1.0)
+        metrics['chi2_seq'] = self.accelerator.gather_for_metrics(chi2_seq).nanmean().item()
+
+        return metrics
+
+    def _compute_is_correction_metrics(
+        self,
+        rollout_log_ratio: torch.Tensor,
+        is_weights: torch.Tensor,
+        completion_mask: torch.Tensor,
+    ) -> Dict[str, float]:
+        """
+        Compute importance sampling correction metrics (ess, clipped_frac, is_weight_mean).
+        Only called when rollout_importance_sampling_mode is enabled.
+
+        Args:
+            rollout_log_ratio: Log ratio log(π_policy / π_rollout), shape [B, T]
+            is_weights: Importance sampling weights after correction, shape [B, T]
+            completion_mask: Boolean mask for completion tokens, shape [B, T]
+
+        Returns:
+            Dictionary with IS-specific metrics:
+                - is_weight_mean: Mean of IS weights
+                - ess: Effective Sample Size = 1 / E[(w_i / E[w_i])²]
+                - clipped_frac: Fraction of clipped/masked samples
+        """
+        metrics = {}
+        SAFETY_BOUND = 20.0
+        threshold = self.rollout_importance_sampling_threshold
+
+        def masked_mean(x, mask):
+            return (x * mask).sum() / mask.sum().clamp(min=1.0)
+
+        log_ratio_safe = torch.clamp(rollout_log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND)
+        is_ratio = torch.exp(log_ratio_safe)
+
+        dummy = getattr(self, '_is_dummy_loss_chunk', False)
+        mean_is_weight = masked_mean(is_weights, completion_mask)
+        if dummy:
+            mean_is_weight = torch.full_like(mean_is_weight, float('nan'))
+        metrics['is_weight_mean'] = self.accelerator.gather_for_metrics(mean_is_weight).nanmean().item()
+
+        # ESS uses the actual truncated/masked loss weights, with no extra floor.
+        weights_for_ess = is_weights.detach()
+        if self.rollout_importance_sampling_mode in ['token_truncate', 'token_mask']:
+            ess_weights, ess_mask = weights_for_ess, completion_mask.float()
+        else:
+            # Sequence-level weights are constant within a row: count each sequence once.
+            ess_mask = completion_mask.any(-1).float()
+            ess_weights = (weights_for_ess * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1)
+        # Pool moments across ranks: a one-sequence chunk would otherwise always report ESS=1.
+        moments = torch.stack([(ess_weights * ess_mask).sum(), (ess_weights.square() * ess_mask).sum(),
+                               ess_mask.sum()]).float()
+        if dummy:
+            moments = torch.zeros_like(moments)
+        s1, s2, n = self.accelerator.gather(moments.unsqueeze(0)).view(-1, 3).sum(0)
+        if n == 0:
+            metrics['ess'] = float('nan')
+        else:
+            # Every weight masked to zero leaves no effective samples.
+            metrics['ess'] = (s1.square() / (n * s2)).item() if s2 > 0 else 0.0
+
+        if self.rollout_importance_sampling_mode in ['token_truncate', 'token_mask']:
+            if self.rollout_importance_sampling_mode == 'token_truncate':
+                clipped_frac = masked_mean((is_ratio > threshold).float(), completion_mask)
+            else:
+                clipped_frac = masked_mean((is_weights == 0).float(), completion_mask)
+            if dummy:
+                clipped_frac = torch.full_like(clipped_frac, float('nan'))
+            metrics['clipped_frac'] = self.accelerator.gather_for_metrics(clipped_frac).nanmean().item()
+        else:
+            seq_ratios = self._compute_sequence_level_ratios(is_ratio, completion_mask)
+            clipped_frac = (seq_ratios > threshold).float().mean()
+            if dummy:
+                clipped_frac = torch.full_like(clipped_frac, float('nan'))
+            metrics['clipped_frac'] = self.accelerator.gather_for_metrics(clipped_frac).nanmean().item()
+
+        return metrics
+
+    def _get_eval_sampler(self, eval_dataset):
+        return RepeatSampler(
+            data_source=eval_dataset,
+            mini_repeat_count=self.num_generations_eval,
+            seed=self.args.seed,
+        )

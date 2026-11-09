@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reframe-training"
+version = "0.1.0"
+description = "Reframe visual tools, GD-GRPO, OG-MOPD and benchmark evaluation"
+requires-python = ">=3.10"
+dependencies = ["pillow"]
+
+[tool.setuptools.packages.find]
+include = ["reframe*", "evaluation*"]
+
+[tool.setuptools.package-data]
+evaluation = ["launchers/*.sh"]
