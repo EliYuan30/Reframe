@@ -248,6 +248,7 @@ def _tool_schemas(mode: str) -> List[Dict[str, Any]]:
 class ReframeDatasetPreprocessor(RowPreprocessor):
     def __init__(self, mode: str, media_root: Optional[str] = None):
         super().__init__()
+        self.columns.clear()
         self.mode = mode
         self.media_root = media_root
         if mode in {"video", "mix"}:
