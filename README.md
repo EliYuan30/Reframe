@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href=""><img src="https://img.shields.io/badge/arXiv-coming_soon-b31b1b?logo=arxiv&amp;logoColor=white" alt="arXiv (coming soon)"></a>
+  <a href="https://arxiv.org/abs/2611.12886"><img src="https://img.shields.io/badge/arXiv-2611.12886-b31b1b?logo=arxiv&amp;logoColor=white" alt="arXiv: 2611.12886"></a>
   <a href="https://huggingface.co/EliYuan00/Reframe"><img src="https://img.shields.io/badge/🤗_Model-Reframe-FFD21E" alt="Hugging Face model"></a>
   <a href="https://huggingface.co/datasets/EliYuan00/Reframe-100K"><img src="https://img.shields.io/badge/🤗_Dataset-Reframe--100K-FFD21E" alt="Hugging Face dataset"></a>
 </p>
@@ -259,4 +259,18 @@ For external models and observation-dependence evaluation, see:
 ```bash
 python evaluation/run.py benchmark --help
 python evaluation/run.py dependence --help
+```
+
+## Citation
+
+```bibtex
+@misc{yuan2026reframeobservationalignedmultiteacheronpolicy,
+      title={Reframe: Observation-Aligned Multi-Teacher On-Policy Distillation for Agentic Visual Reasoning},
+      author={Haozhi Yuan and Handong Li and Yifan Zhang and Qianshan Wei},
+      year={2026},
+      eprint={2611.12886},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2611.12886},
+}
 ```
