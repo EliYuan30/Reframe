@@ -13,6 +13,7 @@
   <a href="https://arxiv.org/abs/2611.12886"><img src="https://img.shields.io/badge/arXiv-2611.12886-b31b1b?logo=arxiv&amp;logoColor=white" alt="arXiv: 2611.12886"></a>
   <a href="https://huggingface.co/EliYuan00/Reframe"><img src="https://img.shields.io/badge/🤗_Model-Reframe-FFD21E" alt="Hugging Face model"></a>
   <a href="https://huggingface.co/datasets/EliYuan00/Reframe-100K"><img src="https://img.shields.io/badge/🤗_Dataset-Reframe--100K-FFD21E" alt="Hugging Face dataset"></a>
+  <a href="https://paperswithcode.co/api/v1/papers/2611.12886/leaderboard-badge-link?eval=47646"><img src="https://paperswithcode.co/api/v1/papers/2611.12886/leaderboard-badge.svg?eval=47646&amp;live=1" alt="Papers with Code: SOTA on HR-Bench 8K"></a>
 </p>
 
 <p align="center">
